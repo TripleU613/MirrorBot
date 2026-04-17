@@ -127,7 +127,32 @@ function friendlyError(e: unknown): string {
 
 export default {
   async scheduled(_: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 8).catch(() => {}));
+    ctx.waitUntil(Promise.all([
+      refreshVerifiedPool(env.RATE_KV, 8).catch(() => {}),
+      // Auto-refresh tokens if expired or missing
+      (async () => {
+        const { acquireToken, getStoredToken, seedToken } = await import("./gplay");
+        const [t64, t32] = await Promise.all([
+          getStoredToken(env.RATE_KV, "arm64"),
+          getStoredToken(env.RATE_KV, "armeabi"),
+        ]);
+        if (!t64 || !t32) {
+          const [a64, a32] = await Promise.allSettled([
+            t64 ? null : acquireToken("arm64"),
+            t32 ? null : acquireToken("armeabi"),
+          ]);
+          const tok64 = a64.status === "fulfilled" && a64.value ? a64.value : null;
+          const tok32 = a32.status === "fulfilled" && a32.value ? a32.value : null;
+          if (tok64 || tok32) {
+            await seedToken(env.RATE_KV,
+              tok64?.authToken ?? t64 ?? "",
+              tok32?.authToken ?? t32 ?? "",
+              tok64 ?? undefined, tok32 ?? undefined);
+            console.log("cron: refreshed gplay tokens");
+          }
+        }
+      })().catch(e => console.warn("cron: token refresh failed:", e)),
+    ]));
   },
 
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -159,6 +184,42 @@ export default {
           body.armeabi ? { gsfId: body.armeabi_gsf, dfeCookie: body.armeabi_dfe, userAgent: body.armeabi_ua, mccMnc: body.armeabi_mcc } : undefined,
         );
         return Response.json({ ok: true, message: "Tokens stored. Downloads enabled for ~60 days." });
+      } catch (e) { return Response.json({ error: String(e) }, { status: 500 }); }
+    }
+
+    // ── Test AuroraStore auth from this Worker
+    if (req.method === "GET" && url.pathname === "/test-auth") {
+      try {
+        const { acquireToken } = await import("./gplay");
+        const result = await acquireToken("arm64");
+        return Response.json({ ok: true, gsfId: result.gsfId, hasToken: !!result.authToken });
+      } catch (e) {
+        return Response.json({ error: String(e) }, { status: 500 });
+      }
+    }
+
+    // ── Auto-acquire and store tokens
+    if (req.method === "POST" && url.pathname === "/auto-auth") {
+      try {
+        const { acquireToken } = await import("./gplay");
+        const [s64, s32] = await Promise.all([
+          acquireToken("arm64").catch(e => ({ error: String(e) })),
+          acquireToken("armeabi").catch(e => ({ error: String(e) })),
+        ]);
+        const arm64 = "authToken" in s64 ? s64 : null;
+        const armeabi = "authToken" in s32 ? s32 : null;
+        if (!arm64 && !armeabi) {
+          return Response.json({ error: "Both acquisitions failed", arm64: s64, armeabi: s32 }, { status: 500 });
+        }
+        if (arm64 || armeabi) {
+          await seedToken(env.RATE_KV,
+            arm64 ? arm64.authToken : "",
+            armeabi ? armeabi.authToken : "",
+            arm64 ? { gsfId: arm64.gsfId, dfeCookie: arm64.dfeCookie, userAgent: arm64.userAgent, mccMnc: arm64.mccMnc } : undefined,
+            armeabi ? { gsfId: armeabi.gsfId, dfeCookie: armeabi.dfeCookie, userAgent: armeabi.userAgent, mccMnc: armeabi.mccMnc } : undefined,
+          );
+        }
+        return Response.json({ ok: true, arm64: !!arm64, armeabi: !!armeabi });
       } catch (e) { return Response.json({ error: String(e) }, { status: 500 }); }
     }
 

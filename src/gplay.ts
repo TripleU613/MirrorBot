@@ -51,6 +51,111 @@ function defaultSession(authToken: string): AuthSession {
   };
 }
 
+// Device profiles baked in (from gplay-apk-downloader/profiles/)
+// We inline the Pixel 9a profile — it's the top-priority ARM64 profile.
+const PROFILE_PV: Record<string, string> = {
+  "UserReadableName": "Google Pixel 9a",
+  "Build.HARDWARE": "tegu", "Build.BRAND": "google",
+  "Build.VERSION.SDK_INT": "35", "Build.MODEL": "Pixel 9a",
+  "Build.DEVICE": "tegu", "Build.PRODUCT": "tegu",
+  "Build.MANUFACTURER": "Google", "Build.ID": "BD4A.250405.003",
+  "Build.FINGERPRINT": "google/tegu/tegu:15/BD4A.250405.003/13238919:user/release-keys",
+  "Build.TYPE": "user", "Build.TAGS": "release-keys",
+  "Build.VERSION.RELEASE": "15", "Build.RADIO": "g5300t-241101-241226-B-12850354",
+  "Build.BOOTLOADER": "tegu-16.0-13238451",
+  "Build.SUPPORTED_ABIS": "arm64-v8a,armeabi-v7a,armeabi",
+  "Platforms": "arm64-v8a", "Screen.Width": "1080", "Screen.Height": "2424",
+  "Screen.Density": "420", "ScreenLayout": "2", "HasHardKeyboard": "false",
+  "HasFiveWayNavigation": "false", "Keyboard": "1", "Navigation": "1", "TouchScreen": "3",
+  "GSF.version": "251333035", "Vending.version": "84582130",
+  "Vending.versionString": "45.8.21-31 [0] [PR] 747433787",
+  "Client": "android-google", "Roaming": "mobile-notroaming", "TimeZone": "UTC-10",
+  "CellOperator": "310", "SimOperator": "38",
+  "GL.Version": "196610",
+  "Locales": "en,en_US,en_GB,de,de_DE,fr,fr_FR,es,es_ES,it,it_IT,ja,ja_JP,ko,ko_KR,zh_CN,zh_TW,pt,pt_BR,ru,ru_RU,ar,ar_EG,nl,nl_NL,pl,pl_PL,sv,sv_SE,tr,tr_TR",
+  "SharedLibraries": "android.test.base,android.test.mock,com.google.android.gms,android.ext.shared,org.apache.http.legacy",
+  "Features": "android.hardware.sensor.proximity,android.hardware.sensor.accelerometer,android.hardware.faketouch,android.hardware.touchscreen,android.hardware.touchscreen.multitouch,android.hardware.wifi,android.hardware.bluetooth,android.hardware.camera,android.hardware.camera.autofocus,android.hardware.microphone,android.hardware.screen.portrait,android.hardware.location,android.hardware.location.gps,android.hardware.fingerprint,android.hardware.nfc,android.software.webview,com.google.android.feature.GOOGLE_EXPERIENCE,com.google.android.feature.PIXEL_EXPERIENCE",
+  "GL.Extensions": "GL_OES_EGL_image,GL_OES_EGL_image_external,GL_OES_depth24,GL_OES_depth_texture,GL_OES_element_index_uint,GL_OES_texture_float,GL_KHR_texture_compression_astc_ldr,GL_EXT_texture_filter_anisotropic,GL_OES_rgb8_rgba8",
+};
+
+// ARMv7 profile (Samsung Galaxy J5 Prime — XK, top ARMv7 priority)
+const PROFILE_XK: Record<string, string> = {
+  "UserReadableName": "Samsung Galaxy J5 Prime",
+  "Build.HARDWARE": "universal7570", "Build.BRAND": "samsung",
+  "Build.VERSION.SDK_INT": "28", "Build.MODEL": "SM-G570F",
+  "Build.DEVICE": "on5xelte", "Build.PRODUCT": "on5xeltexx",
+  "Build.MANUFACTURER": "samsung", "Build.ID": "PPR1.180610.011",
+  "Build.FINGERPRINT": "samsung/on5xeltexx/on5xelte:9/PPR1.180610.011/G570FXXU7CSC2:user/release-keys",
+  "Build.TYPE": "user", "Build.TAGS": "release-keys",
+  "Build.VERSION.RELEASE": "9", "Build.RADIO": "G570FXXU7CSC2",
+  "Build.BOOTLOADER": "G570FXXU7CSC2",
+  "Build.SUPPORTED_ABIS": "armeabi-v7a,armeabi",
+  "Platforms": "armeabi-v7a", "Screen.Width": "720", "Screen.Height": "1280",
+  "Screen.Density": "320", "ScreenLayout": "2", "HasHardKeyboard": "false",
+  "HasFiveWayNavigation": "false", "Keyboard": "1", "Navigation": "1", "TouchScreen": "3",
+  "GSF.version": "214913988", "Vending.version": "80941800",
+  "Vending.versionString": "19.4.18-all [0] [PR] 302028539",
+  "Client": "android-google", "Roaming": "mobile-notroaming", "TimeZone": "UTC-5",
+  "CellOperator": "310", "SimOperator": "260",
+  "GL.Version": "196610",
+  "Locales": "en,en_US,en_GB,de,de_DE,fr,fr_FR,es,es_ES",
+  "SharedLibraries": "android.test.base,com.google.android.gms,android.ext.shared,org.apache.http.legacy",
+  "Features": "android.hardware.sensor.accelerometer,android.hardware.faketouch,android.hardware.touchscreen,android.hardware.touchscreen.multitouch,android.hardware.wifi,android.hardware.bluetooth,android.hardware.camera,android.hardware.microphone,android.hardware.location,android.software.webview",
+  "GL.Extensions": "GL_OES_EGL_image,GL_OES_EGL_image_external,GL_OES_depth24,GL_OES_rgb8_rgba8",
+};
+
+export interface AcquiredAuth {
+  authToken: string;
+  gsfId: string;
+  dfeCookie?: string;
+  userAgent: string;
+  mccMnc: string;
+  deviceCheckInToken?: string;
+  deviceConfigToken?: string;
+}
+
+export async function acquireToken(arch: "arm64" | "armeabi"): Promise<AcquiredAuth> {
+  const profile = arch === "arm64" ? PROFILE_PV : PROFILE_XK;
+
+  const res = await fetch("https://auroraoss.com/api/auth", {
+    method: "POST",
+    headers: {
+      "User-Agent": "com.aurora.store-4.6.1-70",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(profile),
+    cf: { cacheTtl: 0 },
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new GPlayError(`AuroraStore HTTP ${res.status}: ${body.slice(0, 100)}`);
+  }
+
+  const data = await res.json() as {
+    authToken?: string;
+    gsfId?: string;
+    dfeCookie?: string;
+    deviceCheckInConsistencyToken?: string;
+    deviceConfigToken?: string;
+    deviceInfoProvider?: { userAgentString?: string; mccMnc?: string };
+  };
+
+  const tok = data.authToken;
+  if (!tok) throw new GPlayError("AuroraStore returned no authToken");
+
+  return {
+    authToken: tok,
+    gsfId: data.gsfId ?? profile["GSF.version"] ?? "",
+    dfeCookie: data.dfeCookie,
+    userAgent: data.deviceInfoProvider?.userAgentString
+      ?? `Android-Finsky/${profile["Vending.versionString"]} (api=3,versionCode=${profile["Vending.version"]},sdk=${profile["Build.VERSION.SDK_INT"]},device=${profile["Build.DEVICE"]},hardware=${profile["Build.HARDWARE"]},product=${profile["Build.PRODUCT"]},platformVersionRelease=${profile["Build.VERSION.RELEASE"]},model=${encodeURIComponent(profile["Build.MODEL"] ?? "")},buildId=${profile["Build.ID"]},isWideScreen=0,supportedAbis=${profile["Platforms"]})`,
+    mccMnc: data.deviceInfoProvider?.mccMnc ?? "310260",
+    deviceCheckInToken: data.deviceCheckInConsistencyToken,
+    deviceConfigToken: data.deviceConfigToken,
+  };
+}
+
 export async function getSession(kv: KVNamespace, arch: "arm64" | "armeabi"): Promise<AuthSession | null> {
   try {
     const raw = await kv.get(AUTH_KV_KEY);
@@ -250,7 +355,24 @@ export async function getVariants(
     getSession(kv, "armeabi"),
   ]);
 
-  if (!s64 && !s32) throw new TokenMissingError();
+  // Auto-acquire tokens if none stored
+  if (!s64 && !s32) {
+    await onProgress?.("acquiring auth token…");
+    try {
+      const [a64, a32] = await Promise.allSettled([
+        acquireToken("arm64"),
+        acquireToken("armeabi"),
+      ]);
+      const tok64 = a64.status === "fulfilled" ? a64.value : null;
+      const tok32 = a32.status === "fulfilled" ? a32.value : null;
+      if (tok64 || tok32) {
+        await seedToken(kv, tok64?.authToken ?? "", tok32?.authToken ?? "",
+          tok64 ? tok64 : undefined, tok32 ? tok32 : undefined);
+        return getVariants(kv, packageName, onProgress); // retry with fresh tokens
+      }
+    } catch { /* fall through to error */ }
+    throw new TokenMissingError();
+  }
 
   await onProgress?.("fetching download info…");
 
