@@ -12,9 +12,8 @@ import { refreshVerifiedPool } from "./proxy-pool";
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   RATE_KV: KVNamespace;
-  SOLVER: { fetch: (req: Request) => Promise<Response> }; // service binding → mirrorbot-solver
-  SCRAPER_API_KEY?: string;  // optional fallback: scraperapi.com
-  FS_URL?: string;           // optional fallback: FlareSolverr via tunnel
+  SCRAPER_API_KEY?: string;  // optional: scraperapi.com free key
+  FS_URL?: string;           // optional: FlareSolverr via Cloudflare Tunnel
 }
 
 interface ExecutionContext {
@@ -47,7 +46,7 @@ async function saveSession(kv: KVNamespace, chatId: number, s: Session): Promise
 // --- Bypass config from env --------------------------------------------
 
 function bypassCfg(env: Env): BypassConfig {
-  return { solver: env.SOLVER, scraperApiKey: env.SCRAPER_API_KEY, fsUrl: env.FS_URL };
+  return { scraperApiKey: env.SCRAPER_API_KEY, fsUrl: env.FS_URL };
 }
 
 // --- Progress helper ----------------------------------------------------
@@ -141,10 +140,11 @@ function friendlyError(e: unknown): string {
 
 
 export default {
-  // Cron: runs every 10 minutes to find and verify working proxies
+  // Cron: runs every 10 minutes — tests a small batch of proxies against APKMirror,
+  // accumulates verified working ones in KV over multiple runs.
   async scheduled(_event: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
-      refreshVerifiedPool(env.RATE_KV, 50)
+      refreshVerifiedPool(env.RATE_KV, 8)  // 8 proxies × 6s max = ~48s max, fits cron budget
         .then(n => console.log(`cron: verified pool refreshed — ${n} working proxies`))
         .catch(e => console.error("cron: refresh failed:", e))
     );
@@ -154,8 +154,8 @@ export default {
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/warmup") {
-      ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 80).then(n => console.log(`warmup: ${n} proxies`)));
-      return new Response("Proxy pool refresh started in background.");
+      ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 8).then(n => console.log(`warmup: ${n} proxies`)));
+      return new Response("Proxy pool refresh started (8 proxies tested). Hit again to add more.");
     }
 
     if (req.method === "GET" && url.pathname === "/setup") {

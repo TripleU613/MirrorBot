@@ -185,20 +185,16 @@ export async function refreshVerifiedPool(kv: KVNamespace, maxTest = 40): Promis
   );
 
   // Test new candidates concurrently (batches of 8)
+  // Test exactly maxTest proxies concurrently — keeps the run within CF's time budget.
   const toTest = candidates.filter(p => !existingKeys.has(`${p.host}:${p.port}`)).slice(0, maxTest);
-  const BATCH = 8;
-
-  for (let i = 0; i < toTest.length && verified.length < 8; i += BATCH) {
-    const batch = toTest.slice(i, i + BATCH);
-    const results = await Promise.allSettled(batch.map(async (p) => {
-      const ok = await verifyProxy(p);
-      return { p, ok };
-    }));
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value.ok) {
-        verified.push({ ...r.value.p, lastVerified: Date.now() });
-        console.log(`proxy-pool: verified working proxy ${r.value.p.host}:${r.value.p.port}`);
-      }
+  const results = await Promise.allSettled(toTest.map(async (p) => {
+    const ok = await verifyProxy(p);
+    return { p, ok };
+  }));
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value.ok) {
+      verified.push({ ...r.value.p, lastVerified: Date.now() });
+      console.log(`proxy-pool: verified working proxy ${r.value.p.host}:${r.value.p.port}`);
     }
   }
 
