@@ -1,6 +1,9 @@
+// Telegram Bot API helpers
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: CallbackQuery;
 }
 
 export interface TelegramMessage {
@@ -10,44 +13,103 @@ export interface TelegramMessage {
   text?: string;
 }
 
+export interface CallbackQuery {
+  id: string;
+  from: { id: number };
+  message?: TelegramMessage;
+  data?: string;
+}
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+  url?: string;
+}
+
+export type InlineKeyboard = InlineKeyboardButton[][];
+
+// --- API call helper ----------------------------------------------------
+
+async function tgCall(token: string, method: string, body: unknown): Promise<unknown> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) return res.json();
+
+    const resp = await res.json().catch(() => ({})) as Record<string, unknown>;
+
+    if (res.status === 429) {
+      const retryAfter = (resp?.parameters as Record<string, unknown>)?.retry_after;
+      await sleep(typeof retryAfter === "number" ? retryAfter * 1000 : 5000);
+      continue;
+    }
+
+    // 400 on editMessageText often means "message not modified" — not a real error
+    if (res.status === 400) {
+      const desc = String((resp as Record<string, unknown>).description ?? "");
+      if (desc.includes("message is not modified")) return resp;
+    }
+
+    throw new Error(`Telegram ${method} failed: ${res.status} — ${JSON.stringify(resp)}`);
+  }
+  throw new Error(`Telegram ${method}: too many retries`);
+}
+
+// --- Public API ---------------------------------------------------------
+
 export async function sendMessage(
   token: string,
   chatId: number,
   text: string,
-  parseMode: "HTML" | "Markdown" = "HTML"
+  keyboard?: InlineKeyboard
+): Promise<TelegramMessage> {
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+  return tgCall(token, "sendMessage", body) as Promise<TelegramMessage>;
+}
+
+export async function editMessage(
+  token: string,
+  chatId: number,
+  messageId: number,
+  text: string,
+  keyboard?: InlineKeyboard
 ): Promise<void> {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: parseMode,
-        disable_web_page_preview: true,
-      }),
-    });
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+  else body.reply_markup = { inline_keyboard: [] };
+  await tgCall(token, "editMessageText", body);
+}
 
-    if (res.ok) return;
+export async function answerCallback(
+  token: string,
+  callbackQueryId: string,
+  text?: string
+): Promise<void> {
+  await tgCall(token, "answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text: text ?? "",
+    show_alert: false,
+  });
+}
 
-    const body = await res.json().catch(() => ({})) as Record<string, unknown>;
-
-    if (res.status === 429) {
-      // Telegram rate limit — honour retry_after
-      const retryAfter = (body?.parameters as Record<string, unknown>)?.retry_after;
-      const waitMs = typeof retryAfter === "number" ? retryAfter * 1000 : 5000;
-      await sleep(waitMs);
-      continue;
-    }
-
-    // 400 usually means bad parse_mode or too-long message — retry with plain text
-    if (res.status === 400 && parseMode !== "Markdown") {
-      await sendMessage(token, chatId, text.replace(/<[^>]+>/g, ""), "Markdown");
-      return;
-    }
-
-    throw new Error(`Telegram sendMessage failed: ${res.status} — ${JSON.stringify(body)}`);
-  }
+export async function sendTyping(token: string, chatId: number): Promise<void> {
+  await tgCall(token, "sendChatAction", { chat_id: chatId, action: "typing" });
 }
 
 export async function setWebhook(token: string, url: string): Promise<unknown> {
@@ -59,6 +121,26 @@ export async function setWebhook(token: string, url: string): Promise<unknown> {
   const body = await res.json();
   if (!res.ok) throw new Error(`setWebhook failed: ${JSON.stringify(body)}`);
   return body;
+}
+
+// --- sendMessage result type --------------------------------------------
+
+interface SendResult { result: { message_id: number } }
+
+export async function sendMessageGetId(
+  token: string,
+  chatId: number,
+  text: string,
+  keyboard?: InlineKeyboard
+): Promise<number> {
+  const r = await tgCall(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+  }) as SendResult;
+  return r.result.message_id;
 }
 
 function sleep(ms: number): Promise<void> {
