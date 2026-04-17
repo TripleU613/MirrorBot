@@ -7,6 +7,7 @@ const MIN_GAP_MS = 1500;
 export type ProgressFn = (text: string) => Promise<void>;
 
 export interface BypassConfig {
+  solver?: { fetch: (req: Request) => Promise<Response> };
   scraperApiKey?: string;
   fsUrl?: string;
 }
@@ -103,7 +104,27 @@ export async function anonFetch(
 ): Promise<string> {
   await waitForSlot(kv);
 
-  // 1. FlareSolverr
+  // 1. Solver Worker (headless Chrome via CF Browser Rendering — always on, no rate limits)
+  if (bypass.solver) {
+    try {
+      const res = await bypass.solver.fetch(
+        new Request("https://solver/fetch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        })
+      );
+      if (res.ok) {
+        const data = await res.json() as { html?: string };
+        if (data.html && !isCfChallenge(data.html)) return data.html;
+      }
+    } catch (e) {
+      console.warn("anonFetch: solver failed:", e);
+      await onProgress?.("retrying via backup route…");
+    }
+  }
+
+  // 2. FlareSolverr
   if (bypass.fsUrl) {
     try {
       const html = await fetchViaFlareSolverr(bypass.fsUrl, url);

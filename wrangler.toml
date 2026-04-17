@@ -6,12 +6,11 @@ compatibility_flags = ["nodejs_compat"]
 # account_id is set via CLOUDFLARE_ACCOUNT_ID env var in CI, or wrangler.local.toml locally
 
 [vars]
-# TELEGRAM_BOT_TOKEN is set as a secret via wrangler secret put / GitHub Actions
+# TELEGRAM_BOT_TOKEN and GPLAY_URL are set as secrets
 
 [[kv_namespaces]]
 binding = "RATE_KV"
-id = "PLACEHOLDER_KV_ID"          # filled in by deploy workflow on first run
-
+id = "4005684ceed0409bb4af872b7473ca62"
 
 [triggers]
-crons = ["*/10 * * * *"]  # verify proxy pool every 10 minutes
+crons = ["*/10 * * * *"]

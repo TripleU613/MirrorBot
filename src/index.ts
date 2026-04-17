@@ -5,15 +5,14 @@ import {
 } from "./telegram";
 import {
   searchApps, getVariants, resolveDownload,
-  CfBlockedError, AppResult, Variant, ProgressFn, BypassConfig,
-} from "./apkmirror";
+  GPlayError, AppResult, Variant, ProgressFn,
+} from "./gplay";
 import { refreshVerifiedPool } from "./proxy-pool";
 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   RATE_KV: KVNamespace;
-  SCRAPER_API_KEY?: string;  // optional: scraperapi.com free key
-  FS_URL?: string;           // optional: FlareSolverr via Cloudflare Tunnel
+  GPLAY_URL: string;  // gplay server URL e.g. https://mirrorbot-gplay.onrender.com
 }
 
 interface ExecutionContext {
@@ -25,7 +24,7 @@ interface ExecutionContext {
 type Session =
   | { step: "idle" }
   | { step: "results"; results: AppResult[]; query: string; messageId: number }
-  | { step: "variants"; variants: Variant[]; appName: string; developer: string; appUrl: string; messageId: number; results?: AppResult[]; query?: string };
+  | { step: "variants"; variants: Variant[]; appName: string; developer: string; packageName: string; messageId: number; results?: AppResult[]; query?: string };
 
 async function getSession(kv: KVNamespace, chatId: number): Promise<Session> {
   try {
@@ -43,27 +42,18 @@ async function saveSession(kv: KVNamespace, chatId: number, s: Session): Promise
   }
 }
 
-// --- Bypass config from env --------------------------------------------
-
-function bypassCfg(env: Env): BypassConfig {
-  return { scraperApiKey: env.SCRAPER_API_KEY, fsUrl: env.FS_URL };
-}
-
 // --- Progress helper ----------------------------------------------------
 
-function makeProgress(
-  token: string, chatId: number, messageId: number, prefix: string
-): ProgressFn {
+function makeProgress(token: string, chatId: number, messageId: number, prefix: string): ProgressFn {
   return async (status: string) => {
-    try {
-      await editMessage(token, chatId, messageId, `${prefix} <i>${esc(status)}</i>`);
-    } catch { /* don't break the flow if progress edit fails */ }
+    try { await editMessage(token, chatId, messageId, `${prefix} <i>${esc(status)}</i>`); }
+    catch { /* ignore */ }
   };
 }
 
 // --- Keyboards ----------------------------------------------------------
 
-function resultsKeyboard(results: AppResult[], withRetry?: string): InlineKeyboard {
+function resultsKeyboard(results: AppResult[]): InlineKeyboard {
   return [
     ...results.map((r, i) => ([{ text: `${r.name}  —  ${r.developer}`, callback_data: `r:${i}` }])),
     [{ text: "✕  Cancel", callback_data: "x" }],
@@ -72,21 +62,25 @@ function resultsKeyboard(results: AppResult[], withRetry?: string): InlineKeyboa
 
 function variantsKeyboard(variants: Variant[]): InlineKeyboard {
   return [
-    ...variants.map((v, i) => ([{
-      text: `v${v.version}  ·  ${v.arch || "universal"}  ·  Android ${v.minAndroid}${v.dpi ? "  ·  " + v.dpi : ""}`,
-      callback_data: `v:${i}`,
-    }])),
+    ...variants.map((v, i) => ([{ text: v.label, callback_data: `v:${i}` }])),
     [{ text: "← Back to results", callback_data: "back" }],
     [{ text: "✕  Cancel", callback_data: "x" }],
   ];
 }
 
-function downloadKeyboard(link: string, appName: string): InlineKeyboard {
-  return [
-    [{ text: `⬇️  Download ${appName}`, url: link }],
-    [{ text: "← Back to variants", callback_data: "back2" }],
-    [{ text: "✕  Done", callback_data: "x" }],
+function downloadKeyboard(v: Variant): InlineKeyboard {
+  const rows: InlineKeyboard = [
+    [{ text: `⬇️  Download APK`, url: v.downloadUrl }],
   ];
+  if (v.isSplit && v.splits?.length) {
+    // Show individual splits if it's a bundle
+    v.splits.slice(0, 3).forEach(s =>
+      rows.push([{ text: `⬇️  ${s.name}`, url: s.url }])
+    );
+  }
+  rows.push([{ text: "← Back to variants", callback_data: "back2" }]);
+  rows.push([{ text: "✕  Done", callback_data: "x" }]);
+  return rows;
 }
 
 function errorKeyboard(backCb: string, retryCb?: string): InlineKeyboard {
@@ -100,63 +94,48 @@ function errorKeyboard(backCb: string, retryCb?: string): InlineKeyboard {
 
 const WELCOME =
   `👋 <b>MirrorBot</b>\n\n` +
-  `Just type any app name to search APKMirror.\n\n` +
+  `Type any app name to search Google Play.\n\n` +
   `<i>Examples: whatsapp, youtube, chrome, spotify</i>`;
 
-function resultsText(query: string): string {
-  return `🔍 <b>Results for "${esc(query)}"</b>\n\nTap an app to see download variants.`;
-}
+const resultsText = (q: string) =>
+  `🔍 <b>Results for "${esc(q)}"</b>\n\nTap an app to see download options.`;
 
-function variantsText(appName: string, developer: string): string {
-  return `📦 <b>${esc(appName)}</b>\nby ${esc(developer)}\n\nTap a variant to get the download link.`;
-}
+const variantsText = (name: string, dev: string) =>
+  `📦 <b>${esc(name)}</b>\nby ${esc(dev)}\n\nChoose your architecture:`;
 
 function downloadText(v: Variant, appName: string): string {
+  const size = v.size ? ` · ${(v.size / 1024 / 1024).toFixed(1)} MB` : "";
   return (
     `⬇️  <b>${esc(appName)}</b>\n\n` +
-    `Version: <code>${esc(v.version)}</code>\n` +
-    `Architecture: <code>${esc(v.arch || "universal")}</code>\n` +
-    `Min Android: <code>${esc(v.minAndroid)}</code>\n` +
-    (v.dpi ? `DPI: <code>${esc(v.dpi)}</code>\n` : "") +
+    `Version: <code>${esc(v.version ?? "latest")}</code>\n` +
+    `Architecture: <code>${esc(v.arch)}</code>${size}\n` +
+    (v.isSplit ? `\n⚠️ Split APK — tap each part to download.\n` : "") +
     `\nTap below to download.`
   );
 }
 
-// --- Friendly error classifier ------------------------------------------
+// --- Error classifier ---------------------------------------------------
 
 function friendlyError(e: unknown): string {
-  if (e instanceof CfBlockedError) return "🚫 APKMirror is rate-limiting us right now. Wait a moment and try again.";
+  if (e instanceof GPlayError) return `⚠️ ${esc(e.message)}`;
   const msg = e instanceof Error ? e.message : String(e);
-  if (/timeout|timed out/i.test(msg)) return "⏱ Took too long to connect. Try again.";
-  if (/HTTP 429/.test(msg)) return "⏱ Too many requests. Wait 30 seconds and try again.";
-  if (/HTTP 403/.test(msg)) return "🚫 Request was blocked. Try again in a moment.";
-  if (/HTTP 5\d\d/.test(msg)) return "⚠️ APKMirror is having issues. Try again shortly.";
-  if (/CONNECT rejected|proxy/i.test(msg)) return "🔄 Routing issue. Try again.";
-  if (/HTTP \d+/.test(msg)) return "⚠️ Unexpected response from APKMirror. Try again.";
+  if (/timeout|timed out/i.test(msg)) return "⏱ Server is waking up (free tier). Try again in 30 seconds.";
+  if (/5\d\d/.test(msg)) return "⚠️ gplay server error. Try again shortly.";
   return "⚠️ Something went wrong. Try again.";
 }
 
 // --- Worker entry -------------------------------------------------------
 
-
 export default {
-  // Cron: runs every 10 minutes — tests a small batch of proxies against APKMirror,
-  // accumulates verified working ones in KV over multiple runs.
   async scheduled(_event: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
-      refreshVerifiedPool(env.RATE_KV, 8)  // 8 proxies × 6s max = ~48s max, fits cron budget
-        .then(n => console.log(`cron: verified pool refreshed — ${n} working proxies`))
-        .catch(e => console.error("cron: refresh failed:", e))
+      refreshVerifiedPool(env.RATE_KV, 8)
+        .catch(e => console.error("cron error:", e))
     );
   },
 
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
-
-    if (req.method === "GET" && url.pathname === "/warmup") {
-      ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 8).then(n => console.log(`warmup: ${n} proxies`)));
-      return new Response("Proxy pool refresh started (8 proxies tested). Hit again to add more.");
-    }
 
     if (req.method === "GET" && url.pathname === "/setup") {
       try {
@@ -167,106 +146,64 @@ export default {
       }
     }
 
-    if (req.method === "POST" && url.pathname === "/webhook") {
-      let update: TelegramUpdate;
-      try { update = await req.json() as TelegramUpdate; }
-      catch (e) { console.error("malformed webhook JSON:", e); return new Response("ok"); }
-
-      // Return 200 to Telegram immediately — process in background.
-      // This prevents Telegram from timing out and retrying the webhook.
-      ctx.waitUntil(
-        dispatch(update, env).catch(e => console.error("dispatch error:", e))
-      );
-
+    if (req.method === "GET" && url.pathname === "/warmup") {
+      ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 8).catch(() => {}));
       return new Response("ok");
     }
 
-    // Debug: GET /test?url=... — check what status APKMirror returns from this Worker
-    if (req.method === "GET" && url.pathname === "/test") {
-      const target = url.searchParams.get("url") ?? "https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s=chrome";
+    if (req.method === "GET" && url.pathname === "/ping-gplay") {
       try {
-        const r = await fetch(target, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.119 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-          },
-          cf: { cacheTtl: 0 },
-        });
-        const body = await r.text();
-        const isChallenge = body.includes("Just a moment") || body.includes("cf-challenge");
-        return Response.json({ status: r.status, challenge: isChallenge, bodyLen: body.length, preview: body.slice(0, 200) });
+        const r = await fetch(`${env.GPLAY_URL}/health`, { cf: { cacheTtl: 0 } });
+        return Response.json({ status: r.status, ok: r.ok });
       } catch (e) {
-        return Response.json({ error: String(e) });
+        return Response.json({ error: String(e) }, { status: 500 });
       }
     }
 
-    return new Response("MirrorBot running.");
+    if (req.method === "POST" && url.pathname === "/webhook") {
+      let update: TelegramUpdate;
+      try { update = await req.json() as TelegramUpdate; }
+      catch (e) { console.error("malformed JSON:", e); return new Response("ok"); }
+
+      ctx.waitUntil(dispatch(update, env).catch(e => console.error("dispatch error:", e)));
+      return new Response("ok");
+    }
+
+    return new Response("MirrorBot (Google Play edition) running.");
   },
 };
 
 // --- Dispatcher ---------------------------------------------------------
 
 async function dispatch(update: TelegramUpdate, env: Env): Promise<void> {
-  if (update.callback_query) {
-    await handleCallback(update.callback_query, env);
-    return;
-  }
-  if (update.message?.text && update.message.chat?.id) {
-    await handleMessage(update.message, env);
-  }
+  if (update.callback_query) { await handleCallback(update.callback_query, env); return; }
+  if (update.message?.text && update.message.chat?.id) await handleMessage(update.message, env);
 }
 
 // --- Message handler ----------------------------------------------------
 
-async function handleMessage(
-  msg: NonNullable<TelegramUpdate["message"]>,
-  env: Env
-): Promise<void> {
+async function handleMessage(msg: NonNullable<TelegramUpdate["message"]>, env: Env): Promise<void> {
   const chatId = msg.chat.id;
   const text = msg.text?.trim() ?? "";
 
-  if (text === "/start" || text === "/help" || text === "/help@JtechMirrorBot") {
+  if (text === "/start" || text === "/help" || text.startsWith("/help@")) {
     await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, WELCOME);
     await saveSession(env.RATE_KV, chatId, { step: "idle" });
     return;
   }
 
-  if (text.startsWith("/dl ")) {
-    const dlUrl = text.slice(4).trim();
-    const mid = await sendMessageGetId(env.TELEGRAM_BOT_TOKEN, chatId, `🔗 Resolving download link…`);
-    const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, mid, "🔗 Resolving…");
-    try {
-      const link = await resolveDownload(env.RATE_KV, dlUrl, bypassCfg(env), onProgress);
-      if (link) {
-        await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, mid, "✅ Here's your link:", [[{ text: "⬇️  Download APK", url: link }]]);
-      } else {
-        await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, mid, "😕 Couldn't find a download link at that URL.");
-      }
-    } catch (e) {
-      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, mid, friendlyError(e));
-    }
-    return;
-  }
-
   if (text.startsWith("/")) return;
 
-  // Plain text → search
   const query = text.trim();
   if (!query) return;
 
-  const messageId = await sendMessageGetId(
-    env.TELEGRAM_BOT_TOKEN, chatId,
-    `🔍 Searching APKMirror for <b>${esc(query)}</b>…`
-  );
-  const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔍 Searching for <b>${esc(query)}</b>…`);
+  const messageId = await sendMessageGetId(env.TELEGRAM_BOT_TOKEN, chatId,
+    `🔍 Searching Google Play for <b>${esc(query)}</b>…`);
+  const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
+    `🔍 Searching for <b>${esc(query)}</b>…`);
 
   try {
-    const results = await searchApps(env.RATE_KV, query, bypassCfg(env), onProgress);
+    const results = await searchApps(env.GPLAY_URL, query, onProgress);
 
     if (!results.length) {
       await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
@@ -289,10 +226,7 @@ async function handleMessage(
 
 // --- Callback handler ---------------------------------------------------
 
-async function handleCallback(
-  cb: NonNullable<TelegramUpdate["callback_query"]>,
-  env: Env
-): Promise<void> {
+async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>, env: Env): Promise<void> {
   const chatId = cb.from.id;
   const messageId = cb.message?.message_id;
   const data = cb.data ?? "";
@@ -302,7 +236,6 @@ async function handleCallback(
 
   const session = await getSession(env.RATE_KV, chatId);
 
-  // Cancel / done
   if (data === "x") {
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
       "👍 Done. Type another app name whenever you're ready.");
@@ -310,14 +243,13 @@ async function handleCallback(
     return;
   }
 
-  // Retry search
   if (data.startsWith("retry:")) {
     const query = decodeURIComponent(data.slice(6));
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      `🔍 Searching APKMirror for <b>${esc(query)}</b>…`);
+      `🔍 Searching Google Play for <b>${esc(query)}</b>…`);
     const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔍 Searching for <b>${esc(query)}</b>…`);
     try {
-      const results = await searchApps(env.RATE_KV, query, bypassCfg(env), onProgress);
+      const results = await searchApps(env.GPLAY_URL, query, onProgress);
       if (!results.length) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
           `😕 Still no results for "<b>${esc(query)}</b>". Try a different name.`);
@@ -332,7 +264,6 @@ async function handleCallback(
     return;
   }
 
-  // Back to results
   if (data === "back") {
     const s = session as unknown as { results?: AppResult[]; query?: string };
     if (s.results && s.query) {
@@ -342,16 +273,13 @@ async function handleCallback(
     return;
   }
 
-  // Back to variants
   if (data === "back2") {
     if (session.step !== "variants") return;
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      variantsText(session.appName, session.developer),
-      variantsKeyboard(session.variants));
+      variantsText(session.appName, session.developer), variantsKeyboard(session.variants));
     return;
   }
 
-  // Pick result → load variants
   if (data.startsWith("r:")) {
     if (session.step !== "results") return;
     const idx = parseInt(data.slice(2), 10);
@@ -359,16 +287,15 @@ async function handleCallback(
     if (!app) return;
 
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      `🔄 Loading variants for <b>${esc(app.name)}</b>…`);
-    const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      `🔄 Loading variants for <b>${esc(app.name)}</b>…`);
+      `🔄 Loading <b>${esc(app.name)}</b>…`);
+    const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔄 Loading <b>${esc(app.name)}</b>…`);
 
     try {
-      const variants = await getVariants(env.RATE_KV, app.url, bypassCfg(env), onProgress);
+      const variants = await getVariants(env.GPLAY_URL, app.packageName, onProgress);
 
       if (!variants.length) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-          `😕 No variants found for <b>${esc(app.name)}</b>.`,
+          `😕 No download available for <b>${esc(app.name)}</b>. App may be paid or region-locked.`,
           errorKeyboard("back", `r:${idx}`));
         return;
       }
@@ -381,7 +308,7 @@ async function handleCallback(
         variants,
         appName: app.name,
         developer: app.developer,
-        appUrl: app.url,
+        packageName: app.packageName,
         messageId,
         results: session.results,
         query: session.query,
@@ -393,7 +320,6 @@ async function handleCallback(
     return;
   }
 
-  // Pick variant → resolve download
   if (data.startsWith("v:")) {
     if (session.step !== "variants") return;
     const idx = parseInt(data.slice(2), 10);
@@ -401,27 +327,7 @@ async function handleCallback(
     if (!variant) return;
 
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      `🔄 Resolving download for <b>${esc(session.appName)}</b> v${esc(variant.version)}…`);
-    const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-      `🔄 Resolving download for <b>${esc(session.appName)}</b> v${esc(variant.version)}…`);
-
-    try {
-      const link = await resolveDownload(env.RATE_KV, variant.downloadPageUrl, bypassCfg(env), onProgress);
-
-      if (!link) {
-        await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-          `😕 Couldn't resolve the download link. Try the <a href="${esc(variant.downloadPageUrl)}">download page</a> directly.`,
-          errorKeyboard("back2", `v:${idx}`));
-        return;
-      }
-
-      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-        downloadText(variant, session.appName),
-        downloadKeyboard(link, session.appName));
-    } catch (e) {
-      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
-        friendlyError(e), errorKeyboard("back2", `v:${idx}`));
-    }
+      downloadText(variant, session.appName), downloadKeyboard(variant));
     return;
   }
 }

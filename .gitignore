@@ -6,3 +6,5 @@ dist/
 .config/
 wrangler.local.toml
 solver/wrangler.local.toml
+
+gplay-apk-downloader

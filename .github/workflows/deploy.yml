@@ -8,7 +8,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy Workers
+    name: Deploy Worker
     steps:
       - uses: actions/checkout@v4
 
@@ -16,59 +16,21 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install main worker dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: Install solver worker dependencies
-        working-directory: solver
-        run: npm ci
-
-      # Deploy solver first (mirrorbot depends on it via service binding)
-      - name: Deploy solver Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          workingDirectory: solver
-          command: deploy
-
-      # Provision KV namespace for main worker
-      - name: Provision KV namespace
-        env:
-          CF_API_EMAIL: ${{ secrets.CF_API_EMAIL }}
-          CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        run: |
-          EXISTING=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces" \
-            -H "X-Auth-Email: ${CF_API_EMAIL}" \
-            -H "X-Auth-Key: ${CF_API_KEY}" | \
-            python3 -c "import sys,json; d=json.load(sys.stdin); ns=[n['id'] for n in (d.get('result') or []) if n['title']=='mirrorbot-rate-kv']; print(ns[0] if ns else '')")
-
-          if [ -z "$EXISTING" ]; then
-            KV_ID=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces" \
-              -H "X-Auth-Email: ${CF_API_EMAIL}" \
-              -H "X-Auth-Key: ${CF_API_KEY}" \
-              -H "Content-Type: application/json" \
-              --data '{"title":"mirrorbot-rate-kv"}' | \
-              python3 -c "import sys,json; print(json.load(sys.stdin)['result']['id'])")
-          else
-            KV_ID="$EXISTING"
-          fi
-
-          echo "KV_ID=$KV_ID" >> $GITHUB_ENV
-          sed -i "s/PLACEHOLDER_KV_ID/$KV_ID/" wrangler.toml
-
-      - name: Deploy main Worker
+      - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: deploy
 
-      - name: Set Telegram bot token secret
+      - name: Set secrets
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GPLAY_URL: ${{ secrets.GPLAY_URL }}
         run: |
-          echo "$TELEGRAM_BOT_TOKEN" | npx wrangler secret put TELEGRAM_BOT_TOKEN \
-            --name mirrorbot
+          echo "$TELEGRAM_BOT_TOKEN" | npx wrangler secret put TELEGRAM_BOT_TOKEN --name mirrorbot
+          echo "$GPLAY_URL" | npx wrangler secret put GPLAY_URL --name mirrorbot
