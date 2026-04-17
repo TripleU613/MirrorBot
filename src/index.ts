@@ -5,7 +5,7 @@ import {
 } from "./telegram";
 import {
   searchApps, getVariants, getAppInfo, resolveDownload,
-  seedToken, getStoredToken, getSession,
+  seedToken, getStoredToken, acquireToken,
   GPlayError, TokenMissingError, TokenExpiredError,
   AppResult, Variant, ProgressFn,
 } from "./gplay";
@@ -131,7 +131,7 @@ export default {
       refreshVerifiedPool(env.RATE_KV, 8).catch(() => {}),
       // Auto-refresh tokens if expired or missing
       (async () => {
-        const { acquireToken, getStoredToken, seedToken } = await import("./gplay");
+        
         const [t64, t32] = await Promise.all([
           getStoredToken(env.RATE_KV, "arm64"),
           getStoredToken(env.RATE_KV, "armeabi"),
@@ -190,7 +190,7 @@ export default {
     // ── Test AuroraStore auth from this Worker
     if (req.method === "GET" && url.pathname === "/test-auth") {
       try {
-        const { acquireToken } = await import("./gplay");
+        
         const result = await acquireToken("arm64");
         return Response.json({ ok: true, gsfId: result.gsfId, hasToken: !!result.authToken });
       } catch (e) {
@@ -201,7 +201,7 @@ export default {
     // ── Auto-acquire and store tokens
     if (req.method === "POST" && url.pathname === "/auto-auth") {
       try {
-        const { acquireToken } = await import("./gplay");
+        
         const [s64, s32] = await Promise.all([
           acquireToken("arm64").catch(e => ({ error: String(e) })),
           acquireToken("armeabi").catch(e => ({ error: String(e) })),
