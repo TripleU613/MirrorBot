@@ -3,7 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-account_id = "2069a0e7348e495373ef64e17cc6ecc1"
+# account_id is set via CLOUDFLARE_ACCOUNT_ID env var in CI, or wrangler.local.toml locally
 
 [browser]
 binding = "BROWSER"

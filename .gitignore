@@ -3,3 +3,6 @@ node_modules/
 dist/
 *.env
 .env*
+.config/
+wrangler.local.toml
+solver/wrangler.local.toml

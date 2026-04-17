@@ -1,0 +1,3 @@
+# Copy this to wrangler.local.toml and fill in your values.
+# wrangler.local.toml is gitignored — never commit it.
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"

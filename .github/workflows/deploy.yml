@@ -28,16 +28,16 @@ jobs:
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: 2069a0e7348e495373ef64e17cc6ecc1
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
           workingDirectory: solver
           command: deploy
 
       # Provision KV namespace for main worker
       - name: Provision KV namespace
         env:
-          CF_API_EMAIL: goyslopgateway@gmail.com
+          CF_API_EMAIL: ${{ secrets.CF_API_EMAIL }}
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          CF_ACCOUNT_ID: 2069a0e7348e495373ef64e17cc6ecc1
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           EXISTING=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces" \
             -H "X-Auth-Email: ${CF_API_EMAIL}" \
@@ -62,7 +62,7 @@ jobs:
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: 2069a0e7348e495373ef64e17cc6ecc1
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: deploy
 
       - name: Set Telegram bot token secret
