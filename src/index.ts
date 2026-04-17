@@ -12,7 +12,6 @@ import { refreshVerifiedPool } from "./proxy-pool";
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   RATE_KV: KVNamespace;
-  GPLAY_URL: string;  // gplay server URL e.g. https://mirrorbot-gplay.onrender.com
 }
 
 interface ExecutionContext {
@@ -119,8 +118,9 @@ function downloadText(v: Variant, appName: string): string {
 function friendlyError(e: unknown): string {
   if (e instanceof GPlayError) return `⚠️ ${esc(e.message)}`;
   const msg = e instanceof Error ? e.message : String(e);
-  if (/timeout|timed out/i.test(msg)) return "⏱ Server is waking up (free tier). Try again in 30 seconds.";
-  if (/5\d\d/.test(msg)) return "⚠️ gplay server error. Try again shortly.";
+  if (/timeout|timed out/i.test(msg)) return "⏱ Took too long. Try again.";
+  if (/token expired/i.test(msg)) return "🔄 Refreshing auth token. Try again.";
+  if (/401|403/.test(msg)) return "🔄 Auth issue. Try again in a moment.";
   return "⚠️ Something went wrong. Try again.";
 }
 
@@ -149,15 +149,6 @@ export default {
     if (req.method === "GET" && url.pathname === "/warmup") {
       ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 8).catch(() => {}));
       return new Response("ok");
-    }
-
-    if (req.method === "GET" && url.pathname === "/ping-gplay") {
-      try {
-        const r = await fetch(`${env.GPLAY_URL}/health`, { cf: { cacheTtl: 0 } });
-        return Response.json({ status: r.status, ok: r.ok });
-      } catch (e) {
-        return Response.json({ error: String(e) }, { status: 500 });
-      }
     }
 
     if (req.method === "POST" && url.pathname === "/webhook") {
@@ -203,7 +194,7 @@ async function handleMessage(msg: NonNullable<TelegramUpdate["message"]>, env: E
     `🔍 Searching for <b>${esc(query)}</b>…`);
 
   try {
-    const results = await searchApps(env.GPLAY_URL, query, onProgress);
+    const results = await searchApps(env.RATE_KV, query, onProgress);
 
     if (!results.length) {
       await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
@@ -249,7 +240,7 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
       `🔍 Searching Google Play for <b>${esc(query)}</b>…`);
     const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔍 Searching for <b>${esc(query)}</b>…`);
     try {
-      const results = await searchApps(env.GPLAY_URL, query, onProgress);
+      const results = await searchApps(env.RATE_KV, query, onProgress);
       if (!results.length) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
           `😕 Still no results for "<b>${esc(query)}</b>". Try a different name.`);
@@ -291,7 +282,7 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
     const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔄 Loading <b>${esc(app.name)}</b>…`);
 
     try {
-      const variants = await getVariants(env.GPLAY_URL, app.packageName, onProgress);
+      const variants = await getVariants(env.RATE_KV, app.packageName, onProgress);
 
       if (!variants.length) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
