@@ -45,13 +45,13 @@ function mkProgress(token: string, chatId: number, msgId: number, prefix: string
 
 const resultsKb = (results: AppResult[]): InlineKeyboard => [
   ...results.map((r, i) => ([{ text: `${r.name}  —  ${r.developer}`, callback_data: `r:${i}` }])),
-  [{ text: "✕  Cancel", callback_data: "x", style: 1 as const }],
+  [{ text: "✕  Cancel", callback_data: "x" }],
 ];
 
 const variantsKb = (variants: Variant[]): InlineKeyboard => [
   ...variants.map((v, i) => ([{ text: v.label, callback_data: `v:${i}` }])),
   [{ text: "← Back to results", callback_data: "back" }],
-  [{ text: "✕  Cancel", callback_data: "x", style: 1 as const }],
+  [{ text: "✕  Cancel", callback_data: "x" }],
 ];
 
 const downloadKb = (v: Variant): InlineKeyboard => {
@@ -66,7 +66,7 @@ const downloadKb = (v: Variant): InlineKeyboard => {
     rows.push([{ text: "↗  Share this APK", switch_inline_query: v.packageName }]);
   }
   rows.push([{ text: "← Back to variants", callback_data: "back2" }]);
-  rows.push([{ text: "✕  Done", callback_data: "x", style: 1 as const }]);
+  rows.push([{ text: "✕  Done", callback_data: "x" }]);
   return rows;
 };
 
@@ -120,7 +120,7 @@ function friendlyError(e: unknown): string {
   if (/timeout|timed out/i.test(msg)) return "⏱ Request timed out. Try again.";
   if (/404|not found/i.test(msg)) return "😕 App not found or not available in your region.";
   if (/401|403/.test(msg)) return "🔑 Auth issue. Token may have expired.";
-  return "⚠️ Something went wrong. Try again.";
+  console.error("unhandled error:", e); return "⚠️ Something went wrong. Try again.";
 }
 
 // ─── Worker ──────────────────────────────────────────────────────────────────
@@ -194,6 +194,7 @@ export default {
         const result = await acquireToken("arm64");
         return Response.json({ ok: true, gsfId: result.gsfId, hasToken: !!result.authToken });
       } catch (e) {
+    console.error("error:", e instanceof Error ? e.message : String(e), e);
         return Response.json({ error: String(e) }, { status: 500 });
       }
     }
@@ -301,6 +302,7 @@ async function handleMessage(msg: NonNullable<TelegramUpdate["message"]>, env: E
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId, resultsText(query), resultsKb(results));
     await saveSession(env.RATE_KV, chatId, { step: "results", results, query, messageId: msgId });
   } catch (e) {
+    console.error("error:", e instanceof Error ? e.message : String(e), e);
     const errText = friendlyError(e);
     try { await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId, errText,
       [[{ text: "🔄  Try again", callback_data: `retry:${encodeURIComponent(query)}` }]]); }
@@ -468,6 +470,7 @@ async function runSearch(
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId, resultsText(query), resultsKb(results));
     await saveSession(env.RATE_KV, chatId, { step: "results", results, query, messageId: msgId });
   } catch (e) {
+    console.error("error:", e instanceof Error ? e.message : String(e), e);
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId, friendlyError(e),
       [[{ text: "🔄  Try again", callback_data: retryCb }]]).catch(() => {});
   }
@@ -497,6 +500,7 @@ async function loadVariants(
       results, query,
     });
   } catch (e) {
+    console.error("error:", e instanceof Error ? e.message : String(e), e);
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
       friendlyError(e), errKb("back", retryCb)).catch(() => {});
   }
