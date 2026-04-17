@@ -3,7 +3,6 @@ import { getProxy, markProxyFailed, markProxyOk, fetchViaProxy } from "./proxy-p
 
 const BASE = "https://www.apkmirror.com";
 const MIN_GAP_MS = 1500;
-const MAX_RETRIES = 4;
 
 export type ProgressFn = (text: string) => Promise<void>;
 
@@ -55,6 +54,10 @@ async function directFetch(url: string): Promise<string> {
   return html;
 }
 
+// Direct-first strategy:
+// 1. Try direct fetch immediately — fast (1-2s), often works CF→CF
+// 2. Only if 403/challenged: try up to 2 proxies as fallback
+// This avoids the old problem of spending 32s on dead proxy retries.
 export async function anonFetch(
   kv: KVNamespace,
   url: string,
@@ -62,46 +65,35 @@ export async function anonFetch(
 ): Promise<string> {
   await waitForSlot(kv);
 
-  // Skip proxy attempts if pool is cold (empty KV) — go direct immediately
-  // to avoid spending 5-10s fetching proxy lists on the first request.
-  // The pool will warm up on the next request.
-  const poolRaw = await kv.get("proxy_pool_v2").catch(() => null);
-  const poolSize = poolRaw ? (JSON.parse(poolRaw) as unknown[]).length : 0;
-  if (poolSize === 0) {
-    console.warn("anonFetch: proxy pool empty (cold start), using direct fetch");
-    return directFetch(url);
+  // Step 1: direct fetch
+  try {
+    return await directFetch(url);
+  } catch (e) {
+    const blocked = e instanceof CfBlockedError ||
+      (e instanceof Error && /HTTP 403|HTTP 429/.test(e.message));
+    if (!blocked) throw e; // unexpected error — propagate
+    console.warn(`anonFetch: direct blocked (${e instanceof Error ? e.message : e}), trying proxies`);
+    await onProgress?.("routing around a block…");
   }
 
-  let proxyAttempts = 0;
-
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  // Step 2: proxy fallback (max 2 attempts)
+  for (let attempt = 0; attempt < 2; attempt++) {
     const fp = generateFingerprint();
-    const headers = buildHeaders(fp, attempt > 0 ? BASE + "/" : undefined);
+    const headers = buildHeaders(fp, BASE + "/");
     const proxy = await getProxy(kv);
-
-    if (!proxy) break; // no proxies — skip to direct
-
-    proxyAttempts++;
+    if (!proxy) break;
 
     try {
       const result = await fetchViaProxy(proxy, url, headers);
 
-      if (result.status === 429) {
+      if (result.status === 403 || result.status === 429 || !result.ok) {
         await markProxyFailed(kv, proxy);
-        if (proxyAttempts === 1) await onProgress?.("routing around a block…");
-        await sleep(2000);
-        continue;
-      }
-
-      if (result.status === 403 || !result.ok) {
-        await markProxyFailed(kv, proxy);
-        if (proxyAttempts === 1) await onProgress?.("routing around a block…");
+        if (attempt === 0) await onProgress?.("trying another route…");
         continue;
       }
 
       if (isCfChallenge(result.body)) {
         await markProxyFailed(kv, proxy);
-        if (proxyAttempts === 2) await onProgress?.("trying a different path…");
         continue;
       }
 
@@ -109,16 +101,10 @@ export async function anonFetch(
       return result.body;
     } catch {
       await markProxyFailed(kv, proxy);
-      if (proxyAttempts === 1) await onProgress?.("routing around a block…");
     }
   }
 
-  // Fall back to direct CF egress
-  if (proxyAttempts > 0) {
-    await onProgress?.("connecting directly…");
-    console.warn(`anonFetch: ${proxyAttempts} proxy attempts failed, falling back to direct`);
-  }
-  return directFetch(url);
+  throw new CfBlockedError(url);
 }
 
 // --- search -------------------------------------------------------------
