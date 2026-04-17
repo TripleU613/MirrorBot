@@ -1,0 +1,16 @@
+name = "mirrorbot"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+account_id = "2069a0e7348e495373ef64e17cc6ecc1"
+
+[vars]
+# TELEGRAM_BOT_TOKEN is set as a secret via wrangler secret put / GitHub Actions
+
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "PLACEHOLDER_KV_ID"          # filled in by deploy workflow on first run
+
+[triggers]
+# Telegram sends webhook POSTs to our worker URL
