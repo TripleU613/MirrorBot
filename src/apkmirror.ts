@@ -1,65 +1,72 @@
-// APKMirror scraper — runs inside Cloudflare Workers.
-// CF Workers egress from geographically distributed PoPs, giving natural
-// IP variation. We additionally enforce a per-origin cooldown via KV so
-// we never burst-request (avoids CF 1015 / 1020 bans).
+import { generateFingerprint, buildHeaders } from "./fingerprint";
+import { getProxy, markProxyFailed, markProxyOk, fetchViaProxy } from "./proxy-pool";
 
 const BASE = "https://www.apkmirror.com";
-const MIN_GAP_MS = 2000; // minimum ms between requests to apkmirror
+const MIN_GAP_MS = 1500;
+const MAX_RETRIES = 4; // try up to 4 different proxies
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-// --- rate-limit gate ---------------------------------------------------
+// --- rate-limit gate (KV-backed) ----------------------------------------
 
 async function waitForSlot(kv: KVNamespace): Promise<void> {
-  const key = "last_req_ts";
-  const raw = await kv.get(key);
+  const raw = await kv.get("last_req_ts");
   if (raw) {
     const elapsed = Date.now() - parseInt(raw, 10);
-    if (elapsed < MIN_GAP_MS) {
-      await sleep(MIN_GAP_MS - elapsed);
+    const jitter = Math.random() * 500; // 0–500ms jitter
+    if (elapsed < MIN_GAP_MS + jitter) {
+      await sleep(MIN_GAP_MS + jitter - elapsed);
     }
   }
-  await kv.put(key, String(Date.now()), { expirationTtl: 60 });
+  await kv.put("last_req_ts", String(Date.now()), { expirationTtl: 60 });
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise(r => setTimeout(r, ms));
 }
 
-// --- fetch helper -------------------------------------------------------
+// --- core fetch: new IP + fingerprint every call ------------------------
 
-async function apkFetch(
-  kv: KVNamespace,
-  url: string,
-  cfClearance?: string
-): Promise<string> {
+export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
   await waitForSlot(kv);
 
-  const headers: Record<string, string> = {
-    "User-Agent": UA,
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    Referer: BASE + "/",
-    "Cache-Control": "no-cache",
-  };
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const fp = generateFingerprint();
+    const headers = buildHeaders(fp, attempt > 0 ? BASE + "/" : undefined);
 
-  if (cfClearance) {
-    headers["Cookie"] = `cf_clearance=${cfClearance}`;
+    const proxy = await getProxy(kv);
+
+    if (!proxy) {
+      // No proxies available — fall back to direct fetch (still with rotated fingerprint)
+      const res = await fetch(url, {
+        headers,
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) throw new Error(`Direct fetch HTTP ${res.status}`);
+      return res.text();
+    }
+
+    try {
+      const result = await fetchViaProxy(proxy, url, headers);
+
+      if (result.status === 403 || result.status === 429) {
+        // CF-blocked — this proxy is flagged, kill it
+        await markProxyFailed(kv, proxy);
+        continue;
+      }
+
+      if (!result.ok) {
+        await markProxyFailed(kv, proxy);
+        continue;
+      }
+
+      await markProxyOk(kv, proxy);
+      return result.body;
+    } catch {
+      await markProxyFailed(kv, proxy);
+      // try next proxy
+    }
   }
 
-  const res = await fetch(url, {
-    headers,
-    // Ask CF to route from a random PoP (IP diversity)
-    cf: { cacheTtl: 0, cacheEverything: false },
-  });
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} fetching ${url}`);
-  }
-  return res.text();
+  throw new Error("All proxy attempts failed for " + url);
 }
 
 // --- search -------------------------------------------------------------
@@ -70,18 +77,12 @@ export interface AppResult {
   url: string;
 }
 
-export async function searchApps(
-  kv: KVNamespace,
-  query: string,
-  cfClearance?: string
-): Promise<AppResult[]> {
+export async function searchApps(kv: KVNamespace, query: string): Promise<AppResult[]> {
   const url = `${BASE}/?post_type=app_release&searchtype=app&s=${encodeURIComponent(query)}`;
-  const html = await apkFetch(kv, url, cfClearance);
+  const html = await anonFetch(kv, url);
 
   const results: AppResult[] = [];
-  // Each result lives in a .appRow widget
-  const rowRe =
-    /<div class="[^"]*appRow[^"]*"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/g;
+  const rowRe = /<div class="[^"]*appRow[^"]*"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/g;
   const nameRe = /class="fontBlack"[^>]*>([^<]+)<\/a>/;
   const devRe = /class="byDeveloper"[^>]*>by\s+<a[^>]+>([^<]+)<\/a>/;
   const hrefRe = /class="fontBlack"\s+href="([^"]+)"/;
@@ -93,11 +94,7 @@ export async function searchApps(
     const dev = devRe.exec(chunk)?.[1]?.trim();
     const href = hrefRe.exec(chunk)?.[1];
     if (name && href) {
-      results.push({
-        name,
-        developer: dev ?? "Unknown",
-        url: BASE + href,
-      });
+      results.push({ name, developer: dev ?? "Unknown", url: BASE + href });
     }
   }
   return results;
@@ -113,17 +110,11 @@ export interface Variant {
   downloadPageUrl: string;
 }
 
-export async function getVariants(
-  kv: KVNamespace,
-  appUrl: string,
-  cfClearance?: string
-): Promise<Variant[]> {
-  const html = await apkFetch(kv, appUrl, cfClearance);
+export async function getVariants(kv: KVNamespace, appUrl: string): Promise<Variant[]> {
+  const html = await anonFetch(kv, appUrl);
 
   const variants: Variant[] = [];
-  // variant rows: <div class="table-row headerFont">
-  const rowRe =
-    /<div class="table-row headerFont"[\s\S]*?(?=<div class="table-row headerFont"|<\/div>\s*<\/div>\s*<\/div>)/g;
+  const rowRe = /<div class="table-row headerFont"[\s\S]*?(?=<div class="table-row headerFont"|<\/div>\s*<\/div>\s*<\/div>)/g;
   const cellRe = /<span[^>]*>([^<]*)<\/span>/g;
   const hrefRe = /href="(\/apk\/[^"]+\/download\/)"/;
 
@@ -149,13 +140,9 @@ export async function getVariants(
 
 // --- resolve download URL -----------------------------------------------
 
-export async function resolveDownload(
-  kv: KVNamespace,
-  downloadPageUrl: string,
-  cfClearance?: string
-): Promise<string | null> {
-  const html = await apkFetch(kv, downloadPageUrl, cfClearance);
-  // The real download link is in a <a> with id="download-link" or class="downloadButton"
+export async function resolveDownload(kv: KVNamespace, downloadPageUrl: string): Promise<string | null> {
+  const html = await anonFetch(kv, downloadPageUrl);
+
   const re = /id="download-link"[^>]*href="([^"]+)"/;
   const m = re.exec(html);
   if (m) return m[1].startsWith("http") ? m[1] : BASE + m[1];

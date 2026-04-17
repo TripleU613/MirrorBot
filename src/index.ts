@@ -3,7 +3,6 @@ import { searchApps, getVariants, resolveDownload } from "./apkmirror";
 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
-  CF_CLEARANCE?: string;   // optional: seed a cf_clearance cookie for hard-gated pages
   RATE_KV: KVNamespace;
 }
 
@@ -75,7 +74,7 @@ async function handleUpdate(update: TelegramUpdate, env: Env): Promise<void> {
 
       await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `Searching for <i>${escHtml(query)}</i>…`);
 
-      const results = await searchApps(env.RATE_KV, query, env.CF_CLEARANCE);
+      const results = await searchApps(env.RATE_KV, query);
 
       if (!results.length) {
         await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "No results found.");
@@ -107,7 +106,7 @@ async function handleUpdate(update: TelegramUpdate, env: Env): Promise<void> {
       const app = results[idx];
       await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `Fetching variants for <b>${escHtml(app.name)}</b>…`);
 
-      const variants = await getVariants(env.RATE_KV, app.url, env.CF_CLEARANCE);
+      const variants = await getVariants(env.RATE_KV, app.url);
       sessions.set(chatId, { step: "idle" });
 
       if (!variants.length) {
@@ -131,11 +130,11 @@ async function handleUpdate(update: TelegramUpdate, env: Env): Promise<void> {
     if (text.startsWith("/dl ")) {
       const dlUrl = text.replace(/^\/dl\s+/, "").trim();
       await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "Resolving download link…");
-      const link = await resolveDownload(env.RATE_KV, dlUrl, env.CF_CLEARANCE);
+      const link = await resolveDownload(env.RATE_KV, dlUrl);
       if (link) {
         await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `<a href="${escHtml(link)}">Direct download link</a>`);
       } else {
-        await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "Could not resolve download link. The page may require a cf_clearance cookie.");
+        await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "Could not resolve download link. Try again or use a direct APKMirror download page URL.");
       }
       return;
     }
