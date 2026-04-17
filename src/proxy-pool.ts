@@ -4,43 +4,30 @@ export interface Proxy {
   host: string;
   port: number;
   failures: number;
-  lastSeen: number;
+  lastVerified: number; // timestamp of last successful APKMirror test
 }
 
-const POOL_KEY = "proxy_pool_v2";
-const MAX_FAILURES = 3;
-const POOL_MIN = 10;
-const CONNECT_TIMEOUT_MS = 8000;
+const POOL_KEY = "proxy_pool_v3";
+const VERIFIED_KEY = "proxy_verified_v3";
+const MAX_FAILURES = 2;
+const CONNECT_TIMEOUT_MS = 6000;
+const TEST_URL = "https://www.apkmirror.com/";
 
-const PROXY_SOURCES = [
-  "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=elite,anonymous",
-  "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=3000&country=US,GB,DE,NL,FR&anonymity=elite",
-  "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http",
-];
+// --- KV helpers ---------------------------------------------------------
 
-function timeout<T>(ms: number, label: string): Promise<T> {
-  return new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms)
-  );
-}
-
-// --- Pool KV helpers ----------------------------------------------------
-
-async function loadPool(kv: KVNamespace): Promise<Proxy[]> {
+async function loadPool(kv: KVNamespace, key: string): Promise<Proxy[]> {
   try {
-    const raw = await kv.get(POOL_KEY);
+    const raw = await kv.get(key);
     if (!raw) return [];
     return JSON.parse(raw) as Proxy[];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
-async function savePool(kv: KVNamespace, pool: Proxy[]): Promise<void> {
+async function savePool(kv: KVNamespace, key: string, pool: Proxy[], ttl = 3600): Promise<void> {
   try {
-    await kv.put(POOL_KEY, JSON.stringify(pool), { expirationTtl: 3600 });
+    await kv.put(key, JSON.stringify(pool), { expirationTtl: ttl });
   } catch (e) {
-    console.warn("proxy-pool: failed to save pool to KV:", e);
+    console.warn("proxy-pool: KV save failed:", e);
   }
 }
 
@@ -52,97 +39,199 @@ function shuffle<T>(arr: T[]): T[] {
   return arr;
 }
 
-// --- Fetch fresh proxies ------------------------------------------------
+function timeout<T>(ms: number, label: string): Promise<T> {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout:${label}`)), ms));
+}
 
-async function fetchProxies(): Promise<Proxy[]> {
+// --- Fetch proxy list ---------------------------------------------------
+
+const PROXY_SOURCES = [
+  "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=elite,anonymous",
+  "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=3000&anonymity=elite",
+  "https://proxylist.geonode.com/api/proxy-list?limit=200&page=1&sort_by=lastChecked&sort_type=desc&protocols=http",
+];
+
+async function fetchCandidates(): Promise<Proxy[]> {
+  const seen = new Set<string>();
   const proxies: Proxy[] = [];
-  let anySourceSucceeded = false;
 
   for (const src of PROXY_SOURCES) {
     try {
       const res = await Promise.race([
         fetch(src, { cf: { cacheTtl: 0 } }),
-        timeout<Response>(10000, src),
+        timeout<Response>(12000, src),
       ]);
       const text = await (res as Response).text();
 
-      // proxyscrape format: ip:port per line
+      // proxyscrape: ip:port per line
       for (const line of text.split(/\r?\n/)) {
         const m = line.trim().match(/^(\d+\.\d+\.\d+\.\d+):(\d+)$/);
         if (m) {
-          proxies.push({ host: m[1], port: parseInt(m[2], 10), failures: 0, lastSeen: Date.now() });
-          anySourceSucceeded = true;
+          const k = `${m[1]}:${m[2]}`;
+          if (!seen.has(k)) { seen.add(k); proxies.push({ host: m[1], port: parseInt(m[2], 10), failures: 0, lastVerified: 0 }); }
         }
       }
 
-      // geonode format: JSON { data: [{ ip, port }] }
+      // geonode: JSON { data: [{ip, port}] }
       try {
         const json = JSON.parse(text);
         if (Array.isArray(json?.data)) {
-          for (const entry of json.data) {
-            if (entry.ip && entry.port) {
-              proxies.push({ host: entry.ip, port: parseInt(entry.port, 10), failures: 0, lastSeen: Date.now() });
-              anySourceSucceeded = true;
+          for (const e of json.data) {
+            const k = `${e.ip}:${e.port}`;
+            if (e.ip && e.port && !seen.has(k)) {
+              seen.add(k);
+              proxies.push({ host: e.ip, port: parseInt(e.port, 10), failures: 0, lastVerified: 0 });
             }
           }
         }
-      } catch { /* not JSON, that's fine */ }
+      } catch { /* not JSON */ }
     } catch (e) {
       console.warn(`proxy-pool: source failed (${src}):`, e);
     }
   }
 
-  if (!anySourceSucceeded) {
-    console.warn("proxy-pool: ALL proxy sources failed — pool will be empty");
-  }
-
-  // Deduplicate
-  const seen = new Set<string>();
-  const deduped = proxies.filter(p => {
-    const k = `${p.host}:${p.port}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  return shuffle(deduped);
+  return shuffle(proxies);
 }
 
-// --- Pick proxy ---------------------------------------------------------
+// --- Verify a single proxy against APKMirror ----------------------------
+// Returns true only if the proxy returns real APKMirror HTML (not a CF challenge).
 
-export async function getProxy(kv: KVNamespace): Promise<Proxy | null> {
-  let pool = await loadPool(kv);
-  pool = pool.filter(p => p.failures < MAX_FAILURES);
+export async function verifyProxy(proxy: Proxy): Promise<boolean> {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
 
-  if (pool.length < POOL_MIN) {
-    const fresh = await fetchProxies();
-    const map = new Map(pool.map(p => [`${p.host}:${p.port}`, p]));
-    for (const fp of fresh) {
-      const key = `${fp.host}:${fp.port}`;
-      if (!map.has(key)) map.set(key, fp);
+  let socket;
+  try {
+    socket = await Promise.race([
+      connect({ hostname: proxy.host, port: proxy.port }, { secureTransport: "off" }),
+      timeout<never>(CONNECT_TIMEOUT_MS, "connect"),
+    ]);
+
+    const writer = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+
+    // CONNECT tunnel to apkmirror:443
+    const connectReq = `CONNECT www.apkmirror.com:443 HTTP/1.1\r\nHost: www.apkmirror.com:443\r\nProxy-Connection: keep-alive\r\n\r\n`;
+    await Promise.race([writer.write(enc.encode(connectReq)), timeout<never>(CONNECT_TIMEOUT_MS, "write-connect")]);
+
+    let resp = "";
+    while (!resp.includes("\r\n\r\n")) {
+      const { value, done } = await Promise.race([reader.read(), timeout<never>(CONNECT_TIMEOUT_MS, "read-connect")]);
+      if (done) break;
+      resp += dec.decode(value);
     }
-    pool = shuffle(Array.from(map.values()));
-    await savePool(kv, pool);
+    if (!resp.match(/HTTP\/1\.[01] 2\d\d/)) { writer.releaseLock(); reader.releaseLock(); return false; }
+    writer.releaseLock();
+    reader.releaseLock();
+
+    // TLS upgrade
+    const tlsSocket = socket.startTls({ expectedServerHostname: "www.apkmirror.com" });
+
+    const w2 = tlsSocket.writable.getWriter();
+    const r2 = tlsSocket.readable.getReader();
+
+    const httpReq =
+      `GET / HTTP/1.1\r\n` +
+      `Host: www.apkmirror.com\r\n` +
+      `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.119 Safari/537.36\r\n` +
+      `Accept: text/html,*/*;q=0.8\r\n` +
+      `Accept-Language: en-US,en;q=0.9\r\n` +
+      `Accept-Encoding: identity\r\n` +
+      `Connection: close\r\n\r\n`;
+    await Promise.race([w2.write(enc.encode(httpReq)), timeout<never>(CONNECT_TIMEOUT_MS, "write-http")]);
+
+    let rawResp = "";
+    while (!rawResp.includes("\r\n\r\n")) {
+      const { value, done } = await Promise.race([r2.read(), timeout<never>(8000, "read-http-headers")]);
+      if (done) break;
+      rawResp += dec.decode(value);
+    }
+
+    const statusMatch = rawResp.match(/HTTP\/\d\.?\d?\s+(\d+)/);
+    const status = statusMatch ? parseInt(statusMatch[1]) : 0;
+
+    // Read enough body to check for CF challenge
+    let body = rawResp.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+    for (let i = 0; i < 5 && body.length < 2000; i++) {
+      const { value, done } = await Promise.race([r2.read(), timeout<never>(4000, "read-body")]);
+      if (done) break;
+      body += dec.decode(value);
+    }
+
+    w2.releaseLock();
+    r2.releaseLock();
+
+    // Good proxy: returns 200, no CF challenge page
+    const hasChallenge = body.includes("Just a moment") || body.includes("cf-challenge") || body.includes("cf_clearance");
+    return status === 200 && !hasChallenge;
+  } catch {
+    return false;
+  } finally {
+    try { if (socket) await (socket as { close?: () => Promise<void> }).close?.(); } catch { /* ignore */ }
+  }
+}
+
+// --- Background cron: find + verify working proxies --------------------
+// Call this from the cron handler. Tests up to maxTest candidates, saves
+// any that pass the APKMirror verification into the VERIFIED_KEY pool.
+
+export async function refreshVerifiedPool(kv: KVNamespace, maxTest = 40): Promise<number> {
+  const candidates = await fetchCandidates();
+  const existing = await loadPool(kv, VERIFIED_KEY);
+  const existingKeys = new Set(existing.map(p => `${p.host}:${p.port}`));
+
+  const verified: Proxy[] = existing.filter(p =>
+    p.failures < MAX_FAILURES && Date.now() - p.lastVerified < 30 * 60 * 1000
+  );
+
+  // Test new candidates concurrently (batches of 8)
+  const toTest = candidates.filter(p => !existingKeys.has(`${p.host}:${p.port}`)).slice(0, maxTest);
+  const BATCH = 8;
+
+  for (let i = 0; i < toTest.length && verified.length < 8; i += BATCH) {
+    const batch = toTest.slice(i, i + BATCH);
+    const results = await Promise.allSettled(batch.map(async (p) => {
+      const ok = await verifyProxy(p);
+      return { p, ok };
+    }));
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value.ok) {
+        verified.push({ ...r.value.p, lastVerified: Date.now() });
+        console.log(`proxy-pool: verified working proxy ${r.value.p.host}:${r.value.p.port}`);
+      }
+    }
   }
 
-  const healthy = pool.filter(p => p.failures < MAX_FAILURES);
-  if (!healthy.length) return null;
-  return healthy[Math.floor(Math.random() * healthy.length)];
+  await savePool(kv, VERIFIED_KEY, shuffle(verified), 1800);
+  console.log(`proxy-pool: ${verified.length} verified proxies saved`);
+  return verified.length;
+}
+
+// --- Get a verified proxy for use --------------------------------------
+
+export async function getProxy(kv: KVNamespace): Promise<Proxy | null> {
+  // Prefer verified pool
+  const verified = await loadPool(kv, VERIFIED_KEY);
+  const good = verified.filter(p => p.failures < MAX_FAILURES);
+  if (good.length > 0) return good[Math.floor(Math.random() * good.length)];
+  return null;
 }
 
 export async function markProxyFailed(kv: KVNamespace, proxy: Proxy): Promise<void> {
-  const pool = await loadPool(kv);
-  const p = pool.find(x => x.host === proxy.host && x.port === proxy.port);
-  if (p) { p.failures++; await savePool(kv, pool); }
+  for (const key of [VERIFIED_KEY, POOL_KEY]) {
+    const pool = await loadPool(kv, key);
+    const p = pool.find(x => x.host === proxy.host && x.port === proxy.port);
+    if (p) { p.failures++; await savePool(kv, key, pool); }
+  }
 }
 
 export async function markProxyOk(kv: KVNamespace, proxy: Proxy): Promise<void> {
-  const pool = await loadPool(kv);
+  const pool = await loadPool(kv, VERIFIED_KEY);
   const p = pool.find(x => x.host === proxy.host && x.port === proxy.port);
-  if (p) { p.failures = 0; p.lastSeen = Date.now(); await savePool(kv, pool); }
+  if (p) { p.failures = 0; p.lastVerified = Date.now(); await savePool(kv, VERIFIED_KEY, pool, 1800); }
 }
 
-// --- Fetch via HTTP CONNECT proxy (TCP + optional TLS) ------------------
+// --- fetchViaProxy (unchanged) -----------------------------------------
 
 export async function fetchViaProxy(
   proxy: Proxy,
@@ -153,104 +242,71 @@ export async function fetchViaProxy(
   const host = parsed.hostname;
   const port = parsed.port ? parseInt(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
   const isHttps = parsed.protocol === "https:";
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
 
   let socket = await Promise.race([
     connect({ hostname: proxy.host, port: proxy.port }, { secureTransport: "off" }),
     timeout<never>(CONNECT_TIMEOUT_MS, `connect ${proxy.host}:${proxy.port}`),
   ]);
 
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-
   try {
     if (isHttps) {
-      // Send HTTP CONNECT to establish tunnel
       const writer = socket.writable.getWriter();
       const reader = socket.readable.getReader();
-
       try {
-        const connectReq = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\nProxy-Connection: keep-alive\r\n\r\n`;
         await Promise.race([
-          writer.write(enc.encode(connectReq)),
+          writer.write(enc.encode(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\nProxy-Connection: keep-alive\r\n\r\n`)),
           timeout<never>(CONNECT_TIMEOUT_MS, "CONNECT write"),
         ]);
-
-        // Read proxy response
         let connectResp = "";
         while (!connectResp.includes("\r\n\r\n")) {
-          const { value, done } = await Promise.race([
-            reader.read(),
-            timeout<never>(CONNECT_TIMEOUT_MS, "CONNECT read"),
-          ]);
+          const { value, done } = await Promise.race([reader.read(), timeout<never>(CONNECT_TIMEOUT_MS, "CONNECT read")]);
           if (done) break;
           connectResp += dec.decode(value);
         }
-
-        if (!connectResp.match(/^HTTP\/1\.[01] 2\d\d/)) {
-          throw new Error(`CONNECT rejected: ${connectResp.split("\r\n")[0]}`);
-        }
+        if (!connectResp.match(/HTTP\/1\.[01] 2\d\d/)) throw new Error(`CONNECT rejected: ${connectResp.split("\r\n")[0]}`);
       } finally {
         writer.releaseLock();
         reader.releaseLock();
       }
-
-      // Upgrade to TLS
       socket = socket.startTls({ expectedServerHostname: host });
     }
 
-    // Send HTTP request
-    const writer2 = socket.writable.getWriter();
-    const reader2 = socket.readable.getReader();
-
+    const w2 = socket.writable.getWriter();
+    const r2 = socket.readable.getReader();
     try {
       const path = parsed.pathname + (parsed.search || "");
       const headerLines = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join("\r\n");
-      const httpReq =
-        `GET ${isHttps ? path : url} HTTP/1.1\r\n` +
-        `Host: ${host}\r\n` +
-        `Connection: close\r\n` +
-        `${headerLines}\r\n\r\n`;
-
       await Promise.race([
-        writer2.write(enc.encode(httpReq)),
+        w2.write(enc.encode(`GET ${isHttps ? path : url} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n${headerLines}\r\n\r\n`)),
         timeout<never>(CONNECT_TIMEOUT_MS, "HTTP write"),
       ]);
 
-      // Read response
       let rawResp = "";
       while (!rawResp.includes("\r\n\r\n")) {
-        const { value, done } = await Promise.race([
-          reader2.read(),
-          timeout<never>(CONNECT_TIMEOUT_MS, "HTTP headers read"),
-        ]);
+        const { value, done } = await Promise.race([r2.read(), timeout<never>(CONNECT_TIMEOUT_MS, "HTTP headers read")]);
         if (done) break;
         rawResp += dec.decode(value);
       }
-
       const headerEnd = rawResp.indexOf("\r\n\r\n");
       const rawHead = rawResp.slice(0, headerEnd);
       let body = rawResp.slice(headerEnd + 4);
-
       const statusMatch = rawHead.match(/HTTP\/\d\.?\d?\s+(\d+)/);
       const status = statusMatch ? parseInt(statusMatch[1]) : 0;
       const clMatch = rawHead.match(/content-length:\s*(\d+)/i);
       const contentLength = clMatch ? parseInt(clMatch[1]) : undefined;
 
-      // Read body
       while (true) {
-        const { value, done } = await Promise.race([
-          reader2.read(),
-          timeout<never>(15000, "HTTP body read"),
-        ]);
+        const { value, done } = await Promise.race([r2.read(), timeout<never>(15000, "HTTP body read")]);
         if (done) break;
         body += dec.decode(value);
         if (contentLength !== undefined && enc.encode(body).byteLength >= contentLength) break;
       }
-
       return { ok: status >= 200 && status < 400, status, body };
     } finally {
-      writer2.releaseLock();
-      reader2.releaseLock();
+      w2.releaseLock();
+      r2.releaseLock();
     }
   } finally {
     try { await socket.close(); } catch { /* ignore */ }

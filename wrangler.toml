@@ -17,4 +17,4 @@ binding = "SOLVER"
 service = "mirrorbot-solver"
 
 [triggers]
-# Telegram sends webhook POSTs to our worker URL
+crons = ["*/10 * * * *"]  # verify proxy pool every 10 minutes

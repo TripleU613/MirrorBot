@@ -7,6 +7,7 @@ import {
   searchApps, getVariants, resolveDownload,
   CfBlockedError, AppResult, Variant, ProgressFn, BypassConfig,
 } from "./apkmirror";
+import { refreshVerifiedPool } from "./proxy-pool";
 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
@@ -140,8 +141,22 @@ function friendlyError(e: unknown): string {
 
 
 export default {
+  // Cron: runs every 10 minutes to find and verify working proxies
+  async scheduled(_event: unknown, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      refreshVerifiedPool(env.RATE_KV, 50)
+        .then(n => console.log(`cron: verified pool refreshed — ${n} working proxies`))
+        .catch(e => console.error("cron: refresh failed:", e))
+    );
+  },
+
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
+
+    if (req.method === "GET" && url.pathname === "/warmup") {
+      ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 80).then(n => console.log(`warmup: ${n} proxies`)));
+      return new Response("Proxy pool refresh started in background.");
+    }
 
     if (req.method === "GET" && url.pathname === "/setup") {
       try {
