@@ -4,6 +4,24 @@ export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: CallbackQuery;
+  inline_query?: InlineQuery;
+}
+
+export interface InlineQuery {
+  id: string;
+  from: { id: number };
+  query: string;
+  offset: string;
+}
+
+export interface InlineQueryResult {
+  type: "article" | "photo";
+  id: string;
+  title: string;
+  description?: string;
+  thumb_url?: string;
+  input_message_content?: { message_text: string; parse_mode?: "HTML" | "Markdown" };
+  reply_markup?: { inline_keyboard: InlineKeyboard };
 }
 
 export interface TelegramMessage {
@@ -141,6 +159,31 @@ export async function sendMessageGetId(
     ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
   }) as SendResult;
   return r.result.message_id;
+}
+
+export async function answerInlineQuery(
+  token: string,
+  queryId: string,
+  results: InlineQueryResult[],
+  cacheTime = 60
+): Promise<void> {
+  await tgCall(token, "answerInlineQuery", {
+    inline_query_id: queryId,
+    results,
+    cache_time: cacheTime,
+    is_personal: false,
+  }).catch(() => {});
+}
+
+export async function setWebhookWithInline(token: string, url: string): Promise<unknown> {
+  const res = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, drop_pending_updates: true, allowed_updates: ["message", "callback_query", "inline_query"] }),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(`setWebhook failed: ${JSON.stringify(body)}`);
+  return body;
 }
 
 function sleep(ms: number): Promise<void> {

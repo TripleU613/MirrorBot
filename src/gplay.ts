@@ -1,43 +1,105 @@
 // Google Play APK client — pure Cloudflare Workers TypeScript.
 //
-// How it works:
-//   Search: parse play.google.com HTML → package IDs, then fetch
-//           app detail pages in parallel for names (og:title). No auth.
-//   Auth:   Aurora anonymous token stored in KV (seeded once via /seed-token).
-//           Token lasts weeks–months. FDFE endpoints are accessible from CF Workers.
-//   Download: Google Play delivery API (protobuf) → direct Google CDN URLs.
+// Auth: AuroraStore anonymous token (seeded once via /seed-token, lasts months).
+//       Full auth response stored in KV: authToken, gsfId, dfeCookie, userAgent, mccMnc.
+// Search: play.google.com HTML → package IDs, parallel og:title/icon/dev fetches.
+// Download: Google Play /fdfe/purchase → /fdfe/delivery (protobuf) → direct CDN URLs.
 
 export type ProgressFn = (text: string) => Promise<void>;
 
 export class GPlayError extends Error {
   constructor(msg: string) { super(msg); this.name = "GPlayError"; }
 }
+export class TokenMissingError extends GPlayError {
+  constructor() { super("No auth token — run the seed-token script first."); this.name = "TokenMissingError"; }
+}
+export class TokenExpiredError extends GPlayError {
+  constructor() { super("Auth token expired — re-run the seed-token script."); this.name = "TokenExpiredError"; }
+}
 
-const AUTH_KV_KEY = "gplay_token_v2";
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const AUTH_KV_KEY = "gplay_auth_v3";
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.119 Safari/537.36";
-const FINSKY_UA = "Android-Finsky/38.5.24-29 (api=3,versionCode=84052400,sdk=33,device=sunfish,hardware=sunfish,product=sunfish,platformVersionRelease=13,model=Pixel+4a,buildId=TQ3A.230901.001,isWideScreen=0,supportedAbis=arm64-v8a;armeabi-v7a;armeabi)";
-const ANDROID_ID = "3ac3339d4c0cd207";
+// Encoded targets for delivery response (what fields to include)
+const DFE_ENCODED_TARGETS = "CAESN/qigQYC2AMBFfUbyA7SM5Ij/CvfBoIDgxXrBPsDlQUdMfOLAfoFrwEHgAcBrQYhoA0cGt4MKK0Y2gI";
 
-// ─── Token management ────────────────────────────────────────────────────────
+// ─── Auth storage ─────────────────────────────────────────────────────────────
 
-interface StoredToken {
-  arm64: string;
-  armeabi: string;
+export interface StoredAuth {
+  arm64?: AuthSession;
+  armeabi?: AuthSession;
   seededAt: number;
 }
 
-export async function getStoredToken(kv: KVNamespace, arch: "arm64" | "armeabi"): Promise<string | null> {
+export interface AuthSession {
+  authToken: string;
+  gsfId: string;
+  dfeCookie?: string;
+  userAgent: string;
+  mccMnc: string;
+  deviceCheckInToken?: string;
+  deviceConfigToken?: string;
+}
+
+function defaultSession(authToken: string): AuthSession {
+  return {
+    authToken,
+    gsfId: "3ac3339d4c0cd207",
+    userAgent: "Android-Finsky/38.5.24-29 (api=3,versionCode=84052400,sdk=33,device=sunfish,hardware=sunfish,product=sunfish,platformVersionRelease=13,model=Pixel+4a,buildId=TQ3A.230901.001,isWideScreen=0,supportedAbis=arm64-v8a;armeabi-v7a;armeabi)",
+    mccMnc: "310260",
+  };
+}
+
+export async function getSession(kv: KVNamespace, arch: "arm64" | "armeabi"): Promise<AuthSession | null> {
   try {
     const raw = await kv.get(AUTH_KV_KEY);
     if (!raw) return null;
-    const t = JSON.parse(raw) as StoredToken;
-    return arch === "arm64" ? t.arm64 : t.armeabi;
+    const stored = JSON.parse(raw) as StoredAuth;
+    return (arch === "arm64" ? stored.arm64 : stored.armeabi) ?? null;
   } catch { return null; }
 }
 
-export async function seedToken(kv: KVNamespace, arm64: string, armeabi: string): Promise<void> {
-  const t: StoredToken = { arm64, armeabi, seededAt: Date.now() };
-  await kv.put(AUTH_KV_KEY, JSON.stringify(t), { expirationTtl: 60 * 24 * 3600 }); // 60 days
+export async function seedToken(
+  kv: KVNamespace,
+  arm64: string, armeabi: string,
+  arm64Session?: Partial<AuthSession>,
+  armeabi_session?: Partial<AuthSession>
+): Promise<void> {
+  const stored: StoredAuth = {
+    arm64: arm64 ? { ...defaultSession(arm64), ...arm64Session } : undefined,
+    armeabi: armeabi ? { ...defaultSession(armeabi), ...armeabi_session } : undefined,
+    seededAt: Date.now(),
+  };
+  await kv.put(AUTH_KV_KEY, JSON.stringify(stored), { expirationTtl: 60 * 24 * 3600 });
+}
+
+export async function getStoredToken(kv: KVNamespace, arch: "arm64" | "armeabi"): Promise<string | null> {
+  const s = await getSession(kv, arch);
+  return s?.authToken ?? null;
+}
+
+function buildHeaders(session: AuthSession): Record<string, string> {
+  const h: Record<string, string> = {
+    "Authorization": `Bearer ${session.authToken}`,
+    "User-Agent": session.userAgent,
+    "X-DFE-Device-Id": session.gsfId,
+    "X-DFE-Client-Id": "am-android-google",
+    "X-DFE-Network-Type": "4",
+    "X-DFE-Content-Filters": "",
+    "X-DFE-Request-Params": "timeoutMs=4000",
+    "X-DFE-Encoded-Targets": DFE_ENCODED_TARGETS,
+    "Accept-Language": "en-US",
+    "X-DFE-UserLanguages": "en_US",
+    "X-Limit-Ad-Tracking-Enabled": "false",
+    "X-Ad-Id": "",
+    "X-DFE-No-Prefetch": "true",
+  };
+  if (session.dfeCookie) h["X-DFE-Cookie"] = session.dfeCookie;
+  if (session.mccMnc) h["X-DFE-MCCMNC"] = session.mccMnc;
+  if (session.deviceCheckInToken) h["X-DFE-Device-Checkin-Consistency-Token"] = session.deviceCheckInToken;
+  if (session.deviceConfigToken) h["X-DFE-Device-Config-Token"] = session.deviceConfigToken;
+  return h;
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
@@ -47,6 +109,8 @@ export interface AppResult {
   developer: string;
   packageName: string;
   icon?: string;
+  version?: string;
+  rating?: string;
 }
 
 export async function searchApps(
@@ -56,67 +120,71 @@ export async function searchApps(
 ): Promise<AppResult[]> {
   await onProgress?.("searching Google Play…");
 
-  // Step 1: get package IDs from search page
-  const searchUrl = `https://play.google.com/store/search?q=${encodeURIComponent(query)}&c=apps&hl=en&gl=US`;
-  const res = await fetch(searchUrl, {
+  const url = `https://play.google.com/store/search?q=${encodeURIComponent(query)}&c=apps&hl=en&gl=US`;
+  const res = await fetch(url, {
     headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
     cf: { cacheTtl: 300 },
   });
   if (!res.ok) throw new GPlayError(`Play Store search HTTP ${res.status}`);
   const html = await res.text();
 
-  // Extract unique package IDs from /store/apps/details?id=PKG links
   const pkgRe = /\/store\/apps\/details\?id=([a-zA-Z][a-zA-Z0-9_.]{4,})/g;
   const seen = new Set<string>();
   const packages: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = pkgRe.exec(html)) !== null) {
     const pkg = m[1];
-    if (!seen.has(pkg) && !pkg.includes('&') && pkg.includes('.')) {
+    if (!seen.has(pkg) && !pkg.includes("&") && pkg.split(".").length >= 2) {
       seen.add(pkg);
       packages.push(pkg);
       if (packages.length >= 8) break;
     }
   }
 
-  if (!packages.length) return [];
+  if (!packages.length) {
+    // Fallback: try package-name search
+    if (/^[a-z][a-z0-9]*(\.[a-z0-9_]+){1,}$/.test(query.toLowerCase())) {
+      const result = await fetchAppMeta(query);
+      return result ? [result] : [];
+    }
+    return [];
+  }
 
-  // Step 2: fetch app names + developers in parallel via og:title
-  await onProgress?.("fetching app details…");
-  const results = await Promise.all(packages.map(pkg => fetchAppMeta(pkg)));
+  await onProgress?.("loading app details…");
+  const results = await Promise.all(packages.map(fetchAppMeta));
   return results.filter((r): r is AppResult => r !== null);
 }
 
 async function fetchAppMeta(packageName: string): Promise<AppResult | null> {
   try {
     const res = await fetch(
-      `https://play.google.com/store/apps/details?id=${packageName}&hl=en`,
-      {
-        headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
-        cf: { cacheTtl: 3600 },
-      }
+      `https://play.google.com/store/apps/details?id=${encodeURIComponent(packageName)}&hl=en&gl=US`,
+      { headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" }, cf: { cacheTtl: 3600 } }
     );
     if (!res.ok) return null;
     const html = await res.text();
 
-    const titleM = /property="og:title"\s+content="([^"]+)"/.exec(html) ??
-      /content="([^"]+)"\s+property="og:title"/.exec(html);
-    const authorM = /"author"[^}]*"name":\s*"([^"]+)"/.exec(html);
-    const iconM = /property="og:image"\s+content="([^"]+)"/.exec(html) ??
-      /content="([^"]+)"\s+property="og:image"/.exec(html);
+    const title = (
+      /property="og:title"\s+content="([^"]+)"/.exec(html) ??
+      /content="([^"]+)"\s+property="og:title"/.exec(html)
+    )?.[1]?.replace(/ - Apps on Google Play$/, "").trim();
 
-    const rawTitle = titleM?.[1] ?? packageName;
-    const name = rawTitle.replace(/ - Apps on Google Play$/, "").trim();
-    const developer = authorM?.[1]?.trim() ?? "Unknown";
-    const icon = iconM?.[1];
+    const developer = /"author"[^}]*"name":\s*"([^"]+)"/.exec(html)?.[1]?.trim();
+    const icon = (
+      /property="og:image"\s+content="([^"]+)"/.exec(html) ??
+      /content="([^"]+)"\s+property="og:image"/.exec(html)
+    )?.[1]?.replace(/=s\d+/, "=s128");
 
-    return { name, developer, packageName, icon };
-  } catch {
-    return null;
-  }
+    // Version from description or structured data
+    const version = /"softwareVersion":\s*"([^"]+)"/.exec(html)?.[1] ??
+      /Current Version[^0-9]*([0-9][0-9.a-zA-Z_\-]+)/.exec(html)?.[1];
+
+    if (!title) return null;
+    return { name: title, developer: developer ?? "Unknown", packageName, icon, version };
+  } catch { return null; }
 }
 
-// ─── Minimal protobuf decoder ────────────────────────────────────────────────
+// ─── Protobuf ────────────────────────────────────────────────────────────────
 
 function readVarint(buf: Uint8Array, pos: number): [bigint, number] {
   let result = 0n, shift = 0n;
@@ -129,39 +197,33 @@ function readVarint(buf: Uint8Array, pos: number): [bigint, number] {
   return [result, pos];
 }
 
-function decodeProto(buf: Uint8Array): Map<number, unknown[]> {
+type ProtoFields = Map<number, unknown[]>;
+
+function decodeProto(buf: Uint8Array): ProtoFields {
   const fields = new Map<number, unknown[]>();
   let pos = 0;
   while (pos < buf.length) {
     let tag: bigint;
     [tag, pos] = readVarint(buf, pos);
-    const fieldNum = Number(tag >> 3n);
-    const wireType = Number(tag & 7n);
-    const push = (v: unknown) => {
-      if (!fields.has(fieldNum)) fields.set(fieldNum, []);
-      fields.get(fieldNum)!.push(v);
-    };
-    if (wireType === 0) { let v: bigint; [v, pos] = readVarint(buf, pos); push(v); }
-    else if (wireType === 2) { let len: bigint; [len, pos] = readVarint(buf, pos); const end = pos + Number(len); push(buf.slice(pos, end)); pos = end; }
-    else if (wireType === 5) { pos += 4; }
-    else if (wireType === 1) { pos += 8; }
+    const field = Number(tag >> 3n);
+    const wire = Number(tag & 7n);
+    const push = (v: unknown) => { fields.set(field, [...(fields.get(field) ?? []), v]); };
+    if (wire === 0) { let v: bigint; [v, pos] = readVarint(buf, pos); push(v); }
+    else if (wire === 2) { let l: bigint; [l, pos] = readVarint(buf, pos); const e = pos + Number(l); push(buf.slice(pos, e)); pos = e; }
+    else if (wire === 5) { pos += 4; }
+    else if (wire === 1) { pos += 8; }
     else break;
   }
   return fields;
 }
 
-const dec = new TextDecoder();
-function str(fields: Map<number, unknown[]>, f: number): string {
-  const v = fields.get(f)?.[0]; return v instanceof Uint8Array ? dec.decode(v) : "";
-}
-function bytes(fields: Map<number, unknown[]>, f: number): Uint8Array | null {
-  const v = fields.get(f)?.[0]; return v instanceof Uint8Array ? v : null;
-}
-function allBytes(fields: Map<number, unknown[]>, f: number): Uint8Array[] {
-  return (fields.get(f) ?? []).filter((v): v is Uint8Array => v instanceof Uint8Array);
-}
+const td = new TextDecoder();
+const pStr = (f: ProtoFields, n: number) => { const v = f.get(n)?.[0]; return v instanceof Uint8Array ? td.decode(v) : ""; };
+const pBytes = (f: ProtoFields, n: number) => { const v = f.get(n)?.[0]; return v instanceof Uint8Array ? v : null; };
+const pAllBytes = (f: ProtoFields, n: number): Uint8Array[] => (f.get(n) ?? []).filter((v): v is Uint8Array => v instanceof Uint8Array);
+const pInt = (f: ProtoFields, n: number) => { const v = f.get(n)?.[0]; return typeof v === "bigint" ? Number(v) : 0; };
 
-// ─── Download variants ───────────────────────────────────────────────────────
+// ─── Download ────────────────────────────────────────────────────────────────
 
 export interface Variant {
   arch: string;
@@ -169,7 +231,9 @@ export interface Variant {
   label: string;
   downloadUrl: string;
   size?: number;
+  sizeLabel?: string;
   version?: string;
+  versionCode?: number;
   isSplit: boolean;
   splits?: SplitFile[];
 }
@@ -181,20 +245,25 @@ export async function getVariants(
   packageName: string,
   onProgress?: ProgressFn
 ): Promise<Variant[]> {
-  const token64 = await getStoredToken(kv, "arm64");
-  const token32 = await getStoredToken(kv, "armeabi");
+  const [s64, s32] = await Promise.all([
+    getSession(kv, "arm64"),
+    getSession(kv, "armeabi"),
+  ]);
 
-  if (!token64 && !token32) {
-    throw new GPlayError("No auth token. Run /seed-token to set one up.");
-  }
+  if (!s64 && !s32) throw new TokenMissingError();
 
   await onProgress?.("fetching download info…");
 
   const tasks: Promise<Variant | null>[] = [];
-  if (token64) tasks.push(fetchDelivery(packageName, token64, "arm64"));
-  if (token32) tasks.push(fetchDelivery(packageName, token32, "armeabi"));
+  if (s64) tasks.push(fetchDelivery(packageName, s64, "arm64"));
+  if (s32) tasks.push(fetchDelivery(packageName, s32, "armeabi"));
 
   const results = await Promise.allSettled(tasks);
+
+  // Check if token expired
+  const expired = results.filter(r => r.status === "rejected" && r.reason instanceof TokenExpiredError);
+  if (expired.length === tasks.length) throw new TokenExpiredError();
+
   return results
     .filter((r): r is PromiseFulfilledResult<Variant | null> => r.status === "fulfilled")
     .map(r => r.value)
@@ -203,79 +272,127 @@ export async function getVariants(
 
 async function fetchDelivery(
   packageName: string,
-  token: string,
+  session: AuthSession,
   arch: "arm64" | "armeabi"
 ): Promise<Variant | null> {
-  const enc = new TextEncoder();
-  const docIdBytes = enc.encode(packageName);
+  const headers = buildHeaders(session);
 
-  // Build minimal delivery protobuf request
-  const req: number[] = [
-    0x0a, docIdBytes.length, ...docIdBytes,  // field 1: docId
-    0x18, 0x00,                               // field 3: versionCode=0 (latest)
-    0x28, 0x01,                               // field 5: installSource=1
-  ];
+  // Step 1: Purchase (required to get delivery token for free apps)
+  const enc = new TextEncoder();
+  const pkgBytes = enc.encode(packageName);
+  const purchaseBody = new Uint8Array([
+    0x0a, pkgBytes.length, ...pkgBytes,  // field 1: docId
+    0x10, 0x01,                           // field 2: offerType=1 (free)
+    0x18, 0x00,                           // field 3: ver=0
+  ]);
+
+  try {
+    await fetch("https://android.clients.google.com/fdfe/purchase", {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/x-protobuf" },
+      body: purchaseBody,
+      cf: { cacheTtl: 0 },
+    });
+    // Ignore purchase response — just needed to "activate" the download
+  } catch { /* continue to delivery anyway */ }
+
+  // Step 2: Delivery
+  const deliveryBody = new Uint8Array([
+    0x0a, pkgBytes.length, ...pkgBytes,  // field 1: docId
+    0x18, 0x00,                           // field 3: versionCode=0 (latest)
+    0x28, 0x01,                           // field 5: installSource=1
+  ]);
 
   const res = await fetch("https://android.clients.google.com/fdfe/delivery", {
     method: "POST",
-    headers: {
-      "Authorization": `GoogleLogin auth=${token}`,
-      "User-Agent": FINSKY_UA,
-      "X-DFE-Device-Id": ANDROID_ID,
-      "X-DFE-Client-Id": "am-android-google",
-      "X-DFE-MCCMNC": "310260",
-      "X-DFE-Network-Type": "4",
-      "X-DFE-Content-Filters": "",
-      "X-DFE-Request-Params": "timeoutMs=4000",
-      "Accept-Language": "en-US",
-      "Content-Type": "application/x-protobuf",
-    },
-    body: new Uint8Array(req),
+    headers: { ...headers, "Content-Type": "application/x-protobuf" },
+    body: deliveryBody,
     cf: { cacheTtl: 0 },
   });
 
-  if (res.status === 401) throw new GPlayError("Token expired — re-run /seed-token");
-  if (!res.ok) throw new GPlayError(`Delivery API HTTP ${res.status}`);
+  if (res.status === 401) throw new TokenExpiredError();
+  if (!res.ok) throw new GPlayError(`Delivery HTTP ${res.status}`);
 
   const buf = new Uint8Array(await res.arrayBuffer());
-  return parseDeliveryResponse(buf, packageName, arch);
+  return parseDelivery(buf, packageName, arch);
 }
 
-function parseDeliveryResponse(
-  buf: Uint8Array, packageName: string, arch: "arm64" | "armeabi"
-): Variant | null {
+function parseDelivery(buf: Uint8Array, packageName: string, arch: "arm64" | "armeabi"): Variant | null {
+  // ResponseWrapper.payload(2).deliveryResponse(21).appDeliveryData(1)
   const top = decodeProto(buf);
-  const deliveryBytes = bytes(top, 2) ?? bytes(top, 1);
+  const payload = pBytes(top, 2);
+  if (!payload) return null;
+  const p = decodeProto(payload);
+
+  // Try deliveryResponse at field 21, or fallback field 1/2/4
+  const deliveryBytes = pBytes(p, 21) ?? pBytes(p, 2) ?? pBytes(p, 1);
   if (!deliveryBytes) return null;
   const delivery = decodeProto(deliveryBytes);
-  const appDataBytes = bytes(delivery, 2) ?? bytes(delivery, 4);
+
+  const appDataBytes = pBytes(delivery, 1) ?? pBytes(delivery, 2) ?? pBytes(delivery, 4);
   if (!appDataBytes) return null;
   const appData = decodeProto(appDataBytes);
-  const downloadUrl = str(appData, 3);
+
+  const downloadUrl = pStr(appData, 3);
   if (!downloadUrl) return null;
 
-  const splitChunks = allBytes(appData, 15);
-  const splits: SplitFile[] = splitChunks.map(chunk => {
+  const downloadSize = pInt(appData, 4) || pInt(appData, 9);
+  const versionCode = pInt(appData, 7);
+
+  // Splits: field 15 = split delivery data list
+  const splits: SplitFile[] = pAllBytes(appData, 15).map(chunk => {
     const f = decodeProto(chunk);
-    return { name: str(f, 1) || "split", url: str(f, 5) || str(f, 3) };
+    return { name: pStr(f, 1) || "split", url: pStr(f, 5) || pStr(f, 3), size: pInt(f, 4) };
   }).filter(s => s.url);
 
-  const archLabel = arch === "arm64" ? "arm64 · modern phones" : "armv7 · older phones";
+  const archLabel = arch === "arm64" ? "arm64-v8a" : "armeabi-v7a";
+  const archDesc = arch === "arm64" ? "arm64 · modern phones" : "armv7 · older phones";
+
+  const sizeLabel = downloadSize
+    ? `${(downloadSize / 1024 / 1024).toFixed(1)} MB`
+    : undefined;
+
+  const versionLabel = versionCode ? ` · build ${versionCode}` : "";
 
   return {
-    arch: arch === "arm64" ? "arm64-v8a" : "armeabi-v7a",
+    arch: archLabel,
     packageName,
-    label: archLabel,
+    label: `${archDesc}${versionLabel}${sizeLabel ? "  ·  " + sizeLabel : ""}`,
     downloadUrl,
+    size: downloadSize || undefined,
+    sizeLabel,
+    versionCode: versionCode || undefined,
     isSplit: splits.length > 0,
     splits: splits.length ? splits : undefined,
   };
 }
 
-// ─── resolveDownload — URL already in variant ────────────────────────────────
+// ─── App info (version check, no download) ───────────────────────────────────
 
-export async function resolveDownload(
-  _kv: KVNamespace, downloadUrl: string
-): Promise<string | null> {
-  return downloadUrl || null;
+export interface AppInfo {
+  packageName: string;
+  name: string;
+  developer: string;
+  icon?: string;
+  version?: string;
+  rating?: string;
+  description?: string;
+}
+
+export async function getAppInfo(packageName: string): Promise<AppInfo | null> {
+  const meta = await fetchAppMeta(packageName);
+  if (!meta) return null;
+  return {
+    packageName,
+    name: meta.name,
+    developer: meta.developer,
+    icon: meta.icon,
+    version: meta.version,
+  };
+}
+
+// ─── resolveDownload — URL already known from variant ────────────────────────
+
+export async function resolveDownload(_kv: KVNamespace, url: string): Promise<string | null> {
+  return url || null;
 }
