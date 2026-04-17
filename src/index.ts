@@ -238,6 +238,37 @@ export default {
       return Response.json(result);
     }
 
+    // GET /debug-search?q=whatsapp — test searchApps directly
+    if (req.method === "GET" && url.pathname === "/debug-search") {
+      const q = url.searchParams.get("q") ?? "whatsapp";
+      try {
+        const results = await searchApps(env.RATE_KV, q);
+        return Response.json({ count: results.length, results });
+      } catch (e) {
+        return Response.json({ error: String(e) }, { status: 500 });
+      }
+    }
+
+    // GET /debug-apkpure?pkg=com.whatsapp — test APKPure redirect
+    if (req.method === "GET" && url.pathname === "/debug-apkpure") {
+      const pkg = url.searchParams.get("pkg") ?? "com.whatsapp";
+      const apkUrl = `https://d.apkpure.net/b/APK/${pkg}?version=latest`;
+      try {
+        const res = await fetch(apkUrl, {
+          headers: { "User-Agent": "Mozilla/5.0 Chrome/124.0", "Referer": "https://apkpure.net/" },
+          redirect: "follow",
+          cf: { cacheTtl: 0 },
+        });
+        return Response.json({
+          status: res.status,
+          ok: res.ok,
+          final_url: res.url,
+          has_winudf: res.url.includes("winudf.com"),
+          content_type: res.headers.get("content-type"),
+        });
+      } catch (e) { return Response.json({ error: String(e) }); }
+    }
+
     // ── Telegram webhook
     if (req.method === "POST" && url.pathname === "/webhook") {
       let update: TelegramUpdate;

@@ -435,50 +435,36 @@ export async function getVariants(
 
   if (fdfeVariants.length > 0) return fdfeVariants;
 
-  // FDFE delivery unavailable — fall back to APKPure
-  await onProgress?.("trying alternative source…");
-  const apkpureResults = await Promise.all([
-    fetchApkPureUrl(packageName, "arm64"),
-    fetchApkPureUrl(packageName, "armeabi"),
-  ]);
-
-  const apkpureVariants: Variant[] = [];
-  const archs = ["arm64", "armeabi"] as const;
-  apkpureResults.forEach((url, i) => {
-    if (!url) return;
-    const arch = archs[i];
-    apkpureVariants.push({
-      arch: arch === "arm64" ? "arm64-v8a" : "armeabi-v7a",
+  // FDFE delivery unavailable — fall back to APKPure direct links.
+  // The URL resolves on the user's device (residential IP), not the Worker.
+  await onProgress?.("preparing download links…");
+  return [
+    {
+      arch: "arm64-v8a",
       packageName,
-      label: arch === "arm64" ? "arm64 · modern phones" : "armv7 · older phones",
-      downloadUrl: url,
+      label: "arm64 · modern phones",
+      downloadUrl: apkPureUrl(packageName, "arm64"),
       isSplit: false,
-    });
-  });
-
-  return apkpureVariants;
+    },
+    {
+      arch: "armeabi-v7a",
+      packageName,
+      label: "armv7 · older phones",
+      downloadUrl: apkPureUrl(packageName, "armeabi"),
+      isSplit: false,
+    },
+  ];
 }
 
 // ─── APKPure download fallback ───────────────────────────────────────────────
 // APKPure's d.apkpure.net API is not CF-protected and accessible from Workers.
 // Returns a signed CDN URL (winudf.com) for the latest APK.
 
-async function fetchApkPureUrl(packageName: string, arch: "arm64" | "armeabi"): Promise<string | null> {
-  // APKPure redirects to a signed winudf.com CDN URL — follow the redirect and return the final URL
-  const url = `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": BROWSER_UA,
-      "Referer": "https://apkpure.net/",
-    },
-    redirect: "follow",  // follow the 302 to get the signed CDN URL
-    cf: { cacheTtl: 0 },
-  });
-  // After following redirect, res.url is the final signed CDN URL
-  if (res.ok && res.url && res.url.includes("winudf.com")) {
-    return res.url;
-  }
-  return null;
+function apkPureUrl(packageName: string, arch: "arm64" | "armeabi"): string {
+  // Return the APKPure download URL directly — the user's browser resolves the redirect
+  // to the signed CDN URL. We don't resolve it in the Worker (CF IPs get blocked).
+  const archParam = arch === "arm64" ? "arm64-v8a" : "armeabi-v7a";
+  return `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest&nc=${arch}`;
 }
 
 async function fetchDelivery(
