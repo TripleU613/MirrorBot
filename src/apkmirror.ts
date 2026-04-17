@@ -5,6 +5,8 @@ const BASE = "https://www.apkmirror.com";
 const MIN_GAP_MS = 1500;
 const MAX_RETRIES = 4;
 
+export type ProgressFn = (text: string) => Promise<void>;
+
 export class CfBlockedError extends Error {
   constructor(url: string) { super(`CF challenge on ${url}`); this.name = "CfBlockedError"; }
 }
@@ -47,13 +49,17 @@ async function directFetch(url: string): Promise<string> {
   const fp = generateFingerprint();
   const headers = buildHeaders(fp);
   const res = await fetch(url, { headers, cf: { cacheTtl: 0, cacheEverything: false } });
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const html = await res.text();
   if (isCfChallenge(html)) throw new CfBlockedError(url);
   return html;
 }
 
-export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
+export async function anonFetch(
+  kv: KVNamespace,
+  url: string,
+  onProgress?: ProgressFn
+): Promise<string> {
   await waitForSlot(kv);
 
   let proxyAttempts = 0;
@@ -63,7 +69,7 @@ export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
     const headers = buildHeaders(fp, attempt > 0 ? BASE + "/" : undefined);
     const proxy = await getProxy(kv);
 
-    if (!proxy) break; // no proxies available — skip to direct
+    if (!proxy) break; // no proxies — skip to direct
 
     proxyAttempts++;
 
@@ -72,32 +78,36 @@ export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
 
       if (result.status === 429) {
         await markProxyFailed(kv, proxy);
+        if (proxyAttempts === 1) await onProgress?.("routing around a block…");
         await sleep(2000);
         continue;
       }
 
       if (result.status === 403 || !result.ok) {
         await markProxyFailed(kv, proxy);
+        if (proxyAttempts === 1) await onProgress?.("routing around a block…");
         continue;
       }
 
       if (isCfChallenge(result.body)) {
         await markProxyFailed(kv, proxy);
-        continue; // try another proxy, don't give up yet
+        if (proxyAttempts === 2) await onProgress?.("trying a different path…");
+        continue;
       }
 
       await markProxyOk(kv, proxy);
       return result.body;
-    } catch (e) {
-      if (e instanceof CfBlockedError) { /* try another proxy */ }
+    } catch {
       await markProxyFailed(kv, proxy);
+      if (proxyAttempts === 1) await onProgress?.("routing around a block…");
     }
   }
 
-  // All proxies failed or none available — fall back to direct CF egress.
-  // CF Workers IPs are often trusted by CF-protected sites and this works
-  // well when free proxy pool is exhausted.
-  console.warn(`anonFetch: ${proxyAttempts} proxy attempts failed, falling back to direct fetch for ${url}`);
+  // Fall back to direct CF egress
+  if (proxyAttempts > 0) {
+    await onProgress?.("connecting directly…");
+    console.warn(`anonFetch: ${proxyAttempts} proxy attempts failed, falling back to direct`);
+  }
   return directFetch(url);
 }
 
@@ -109,9 +119,13 @@ export interface AppResult {
   url: string;
 }
 
-export async function searchApps(kv: KVNamespace, query: string): Promise<AppResult[]> {
+export async function searchApps(
+  kv: KVNamespace,
+  query: string,
+  onProgress?: ProgressFn
+): Promise<AppResult[]> {
   const url = `${BASE}/?post_type=app_release&searchtype=app&s=${encodeURIComponent(query)}`;
-  const html = await anonFetch(kv, url);
+  const html = await anonFetch(kv, url, onProgress);
 
   const results: AppResult[] = [];
   const rowRe = /<div class="[^"]*appRow[^"]*"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/g;
@@ -130,12 +144,8 @@ export async function searchApps(kv: KVNamespace, query: string): Promise<AppRes
     }
   }
 
-  if (!results.length) {
-    // Distinguish: valid page with no results vs broken parsing
-    const pageIsValid = html.includes("apkmirror") || html.includes("APKMirror");
-    if (!pageIsValid) {
-      console.warn("apkmirror: searchApps got unexpected HTML for query:", query);
-    }
+  if (!results.length && !html.includes("apkmirror") && !html.includes("APKMirror")) {
+    console.warn("apkmirror: searchApps got unexpected HTML for query:", query);
   }
 
   return results;
@@ -151,8 +161,12 @@ export interface Variant {
   downloadPageUrl: string;
 }
 
-export async function getVariants(kv: KVNamespace, appUrl: string): Promise<Variant[]> {
-  const html = await anonFetch(kv, appUrl);
+export async function getVariants(
+  kv: KVNamespace,
+  appUrl: string,
+  onProgress?: ProgressFn
+): Promise<Variant[]> {
+  const html = await anonFetch(kv, appUrl, onProgress);
 
   const variants: Variant[] = [];
   const rowRe = /<div class="table-row headerFont"[\s\S]*?(?=<div class="table-row headerFont"|<\/div>\s*<\/div>\s*<\/div>)/g;
@@ -181,10 +195,13 @@ export async function getVariants(kv: KVNamespace, appUrl: string): Promise<Vari
 
 // --- resolve download URL -----------------------------------------------
 
-export async function resolveDownload(kv: KVNamespace, downloadPageUrl: string): Promise<string | null> {
-  const html = await anonFetch(kv, downloadPageUrl);
+export async function resolveDownload(
+  kv: KVNamespace,
+  downloadPageUrl: string,
+  onProgress?: ProgressFn
+): Promise<string | null> {
+  const html = await anonFetch(kv, downloadPageUrl, onProgress);
 
-  // Primary patterns
   const re1 = /id="download-link"[^>]*href="([^"]+)"/;
   const m1 = re1.exec(html);
   if (m1) return m1[1].startsWith("http") ? m1[1] : BASE + m1[1];
@@ -193,7 +210,6 @@ export async function resolveDownload(kv: KVNamespace, downloadPageUrl: string):
   const m2 = re2.exec(html);
   if (m2) return m2[1].startsWith("http") ? m2[1] : BASE + m2[1];
 
-  // Fallback: any href with downloadVariant or /APK/ pattern
   const re3 = /href="([^"]*(?:downloadVariant|\/APK\/)[^"]*)"/i;
   const m3 = re3.exec(html);
   if (m3) return m3[1].startsWith("http") ? m3[1] : BASE + m3[1];
