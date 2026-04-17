@@ -1,6 +1,6 @@
 import {
   sendMessage, sendMessageGetId, editMessage, answerCallback,
-  sendTyping, setWebhookWithInline, TelegramUpdate, InlineKeyboard,
+  sendTyping, setupBot, TelegramUpdate, InlineKeyboard,
   answerInlineQuery, InlineQueryResult,
 } from "./telegram";
 import {
@@ -45,23 +45,28 @@ function mkProgress(token: string, chatId: number, msgId: number, prefix: string
 
 const resultsKb = (results: AppResult[]): InlineKeyboard => [
   ...results.map((r, i) => ([{ text: `${r.name}  —  ${r.developer}`, callback_data: `r:${i}` }])),
-  [{ text: "✕  Cancel", callback_data: "x" }],
+  [{ text: "✕  Cancel", callback_data: "x", style: 1 as const }],
 ];
 
 const variantsKb = (variants: Variant[]): InlineKeyboard => [
   ...variants.map((v, i) => ([{ text: v.label, callback_data: `v:${i}` }])),
-  [{ text: "← Back", callback_data: "back" }],
-  [{ text: "✕  Cancel", callback_data: "x" }],
+  [{ text: "← Back to results", callback_data: "back" }],
+  [{ text: "✕  Cancel", callback_data: "x", style: 1 as const }],
 ];
 
 const downloadKb = (v: Variant): InlineKeyboard => {
-  const rows: InlineKeyboard = [[{ text: `⬇️  Download  ${v.sizeLabel ?? ""}`.trim(), url: v.downloadUrl }]];
+  const rows: InlineKeyboard = [
+    [{ text: `⬇️  Download${v.sizeLabel ? "  ·  " + v.sizeLabel : ""}`, url: v.downloadUrl }],
+  ];
   if (v.isSplit && v.splits?.length) {
-    // Show each split as a separate button
-    v.splits.slice(0, 5).forEach(s => rows.push([{ text: `⬇️  ${s.name}${s.size ? "  ·  " + (s.size / 1024 / 1024).toFixed(1) + " MB" : ""}`, url: s.url }]));
+    v.splits.slice(0, 5).forEach(s =>
+      rows.push([{ text: `⬇️  ${s.name}${s.size ? "  ·  " + (s.size / 1024 / 1024).toFixed(1) + " MB" : ""}`, url: s.url }])
+    );
+    // Share to another chat
+    rows.push([{ text: "↗  Share this APK", switch_inline_query: v.packageName }]);
   }
   rows.push([{ text: "← Back to variants", callback_data: "back2" }]);
-  rows.push([{ text: "✕  Done", callback_data: "x" }]);
+  rows.push([{ text: "✕  Done", callback_data: "x", style: 1 as const }]);
   return rows;
 };
 
@@ -73,25 +78,35 @@ const errKb = (back: string, retry?: string): InlineKeyboard => [
 // ─── Message templates ───────────────────────────────────────────────────────
 
 const WELCOME =
-  `👋 <b>MirrorBot</b> — Google Play APK downloader\n\n` +
-  `Just type any app name to search.\n` +
-  `Or type a package name like <code>com.whatsapp</code>\n\n` +
-  `<i>Examples: whatsapp, youtube, chrome, spotify</i>`;
+  `👋 <b>APK Mirror Bot</b>\n\n` +
+  `Download APKs directly from Google Play.\n\n` +
+  `<blockquote expandable>` +
+  `<b>How to use:</b>\n` +
+  `• Type any app name — <i>whatsapp, chrome, spotify</i>\n` +
+  `• Or a package ID — <code>com.whatsapp</code>\n` +
+  `• Use /info to look up any app by package name\n` +
+  `• Works inline — type <code>@JtechMirrorBot</code> in any chat` +
+  `</blockquote>`;
 
 const resultsText = (q: string) =>
   `🔍 <b>Results for "${esc(q)}"</b>\n\nTap an app to see download options.`;
 
 const variantsText = (name: string, dev: string) =>
-  `📦 <b>${esc(name)}</b>\nby ${esc(dev)}\n\nChoose your architecture:`;
+  `📦 <b>${esc(name)}</b>\n<i>by ${esc(dev)}</i>\n\nChoose your architecture:`;
 
 function downloadText(v: Variant, appName: string): string {
+  const details = [
+    v.arch && `Architecture  <code>${esc(v.arch)}</code>`,
+    v.versionCode && `Build code  <code>${v.versionCode}</code>`,
+    v.sizeLabel && `File size  <code>${v.sizeLabel}</code>`,
+    v.isSplit && `Type  <code>Split APK</code>`,
+  ].filter(Boolean).join("\n");
+
   return (
     `⬇️  <b>${esc(appName)}</b>\n\n` +
-    `Architecture: <code>${esc(v.arch)}</code>\n` +
-    (v.versionCode ? `Build: <code>${v.versionCode}</code>\n` : "") +
-    (v.sizeLabel ? `Size: <code>${v.sizeLabel}</code>\n` : "") +
-    (v.isSplit ? `\n⚠️ This is a split APK. Install all parts with SAI or similar.\n` : "") +
-    `\nTap to download.`
+    `<blockquote>${details}</blockquote>\n` +
+    (v.isSplit ? `\n<i>Split APK — use SAI or similar to install all parts.</i>\n` : "") +
+    `\nTap below to download.`
   );
 }
 
@@ -118,21 +133,11 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
-    // ── Webhook setup
+    // ── Full bot setup (webhook + commands + menu + profile)
     if (req.method === "GET" && url.pathname === "/setup") {
       try {
-        // Register webhook + enable inline mode
-        const [wh] = await Promise.all([
-          setWebhookWithInline(env.TELEGRAM_BOT_TOKEN, `${url.origin}/webhook`),
-          fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ commands: [
-              { command: "start", description: "Welcome / help" },
-              { command: "info", description: "Get app info by package name" },
-            ]}),
-          }),
-        ]);
-        return Response.json(wh);
+        const result = await setupBot(env.TELEGRAM_BOT_TOKEN, `${url.origin}/webhook`);
+        return Response.json(result);
       } catch (e) { return Response.json({ error: String(e) }, { status: 500 }); }
     }
 
@@ -194,7 +199,8 @@ async function handleMessage(msg: NonNullable<TelegramUpdate["message"]>, env: E
   const text = msg.text?.trim() ?? "";
 
   if (text === "/start" || text === "/help" || text.startsWith("/help@")) {
-    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, WELCOME);
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, WELCOME,
+      [[{ text: "🔍  Search an app", switch_inline_query_current_chat: "" }]]);
     await saveSession(env.RATE_KV, chatId, { step: "idle" });
     return;
   }
@@ -248,30 +254,57 @@ async function handleInline(
   env: Env
 ): Promise<void> {
   const q = query.query.trim();
+
+  // Empty query — show hint
   if (!q) {
-    await answerInlineQuery(env.TELEGRAM_BOT_TOKEN, query.id, []);
+    await answerInlineQuery(env.TELEGRAM_BOT_TOKEN, query.id, [], {
+      cacheTime: 0,
+      switchPmText: "Type an app name to search…",
+      switchPmParam: "inline",
+    });
     return;
   }
 
+  const offset = parseInt(query.offset || "0", 10);
+  const PAGE = 5;
+
   try {
-    const results = await searchApps(env.RATE_KV, q);
-    const articles: InlineQueryResult[] = results.map(r => ({
+    const allResults = await searchApps(env.RATE_KV, q);
+    const page = allResults.slice(offset, offset + PAGE);
+
+    const articles: InlineQueryResult[] = page.map(r => ({
       type: "article" as const,
-      id: r.packageName,
+      id: `${r.packageName}_${offset}`,
       title: r.name,
-      description: `${r.developer} · ${r.packageName}`,
-      thumb_url: r.icon,
+      description: `${r.developer}\n${r.packageName}${r.version ? "  ·  v" + r.version : ""}`,
+      thumbnail_url: r.icon,
+      thumbnail_width: 128,
+      thumbnail_height: 128,
       input_message_content: {
-        message_text: `📦 <b>${esc(r.name)}</b>\nby ${esc(r.developer)}\n<code>${esc(r.packageName)}</code>`,
+        message_text:
+          `📦 <b>${esc(r.name)}</b>\n` +
+          `<i>by ${esc(r.developer)}</i>\n` +
+          `<code>${esc(r.packageName)}</code>`,
         parse_mode: "HTML" as const,
+        disable_web_page_preview: true,
       },
-      reply_markup: { inline_keyboard: [[
-        { text: "⬇️  Get APK", callback_data: `pkg:${r.packageName}` },
-      ]]},
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "⬇️  Get APK", callback_data: `pkg:${r.packageName}` }],
+        ],
+      },
     }));
-    await answerInlineQuery(env.TELEGRAM_BOT_TOKEN, query.id, articles, 300);
+
+    const nextOffset = offset + PAGE < allResults.length ? String(offset + PAGE) : "";
+
+    await answerInlineQuery(env.TELEGRAM_BOT_TOKEN, query.id, articles, {
+      cacheTime: 300,
+      nextOffset,
+      switchPmText: "Open full search",
+      switchPmParam: encodeURIComponent(q).slice(0, 64),
+    });
   } catch {
-    await answerInlineQuery(env.TELEGRAM_BOT_TOKEN, query.id, []);
+    await answerInlineQuery(env.TELEGRAM_BOT_TOKEN, query.id, [], { cacheTime: 0 });
   }
 }
 
@@ -282,14 +315,24 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
   const msgId = cb.message?.message_id;
   const data = cb.data ?? "";
 
-  await answerCallback(env.TELEGRAM_BOT_TOKEN, cb.id);
+  // Acknowledge immediately with context-aware toast
+  const toastText =
+    data === "x" ? "Cancelled" :
+    data === "back" || data === "back2" ? "Going back…" :
+    data.startsWith("r:") ? "Loading app…" :
+    data.startsWith("v:") ? "Getting download link…" :
+    data.startsWith("retry:") ? "Retrying…" :
+    data.startsWith("pkg:") ? "Looking up app…" :
+    "";
+  await answerCallback(env.TELEGRAM_BOT_TOKEN, cb.id, toastText || undefined);
   if (!msgId) return;
 
   const session = await getSession(env.RATE_KV, chatId);
 
   // Cancel/done
   if (data === "x") {
-    await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId, "👍 Done. Type an app name to search again.");
+    await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
+      "👍 Done. Type an app name whenever you're ready.");
     await saveSession(env.RATE_KV, chatId, { step: "idle" });
     return;
   }
