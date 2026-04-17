@@ -3,27 +3,45 @@ import { getProxy, markProxyFailed, markProxyOk, fetchViaProxy } from "./proxy-p
 
 const BASE = "https://www.apkmirror.com";
 const MIN_GAP_MS = 1500;
-const MAX_RETRIES = 4; // try up to 4 different proxies
+const MAX_RETRIES = 4;
 
-// --- rate-limit gate (KV-backed) ----------------------------------------
+export class CfBlockedError extends Error {
+  constructor(url: string) { super(`CF challenge on ${url}`); this.name = "CfBlockedError"; }
+}
+
+// --- rate-limit gate ----------------------------------------------------
 
 async function waitForSlot(kv: KVNamespace): Promise<void> {
-  const raw = await kv.get("last_req_ts");
-  if (raw) {
-    const elapsed = Date.now() - parseInt(raw, 10);
-    const jitter = Math.random() * 500; // 0–500ms jitter
-    if (elapsed < MIN_GAP_MS + jitter) {
-      await sleep(MIN_GAP_MS + jitter - elapsed);
+  try {
+    const raw = await kv.get("last_req_ts");
+    if (raw) {
+      const elapsed = Date.now() - parseInt(raw, 10);
+      const jitter = Math.random() * 500;
+      if (elapsed < MIN_GAP_MS + jitter) await sleep(MIN_GAP_MS + jitter - elapsed);
     }
+    await kv.put("last_req_ts", String(Date.now()), { expirationTtl: 60 });
+  } catch (e) {
+    console.warn("apkmirror: KV rate-limit gate failed:", e);
   }
-  await kv.put("last_req_ts", String(Date.now()), { expirationTtl: 60 });
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// --- core fetch: new IP + fingerprint every call ------------------------
+// --- CF challenge detection ---------------------------------------------
+
+function isCfChallenge(html: string): boolean {
+  return (
+    html.includes("cf-challenge") ||
+    html.includes("jschl-answer") ||
+    html.includes("Just a moment") ||
+    html.includes("cf_clearance") ||
+    html.includes("Checking your browser")
+  );
+}
+
+// --- core fetch ---------------------------------------------------------
 
 export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
   await waitForSlot(kv);
@@ -31,24 +49,27 @@ export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     const fp = generateFingerprint();
     const headers = buildHeaders(fp, attempt > 0 ? BASE + "/" : undefined);
-
     const proxy = await getProxy(kv);
 
     if (!proxy) {
-      // No proxies available — fall back to direct fetch (still with rotated fingerprint)
-      const res = await fetch(url, {
-        headers,
-        cf: { cacheTtl: 0, cacheEverything: false },
-      });
+      // No proxies — direct fetch with rotated fingerprint
+      const res = await fetch(url, { headers, cf: { cacheTtl: 0, cacheEverything: false } });
       if (!res.ok) throw new Error(`Direct fetch HTTP ${res.status}`);
-      return res.text();
+      const html = await res.text();
+      if (isCfChallenge(html)) throw new CfBlockedError(url);
+      return html;
     }
 
     try {
       const result = await fetchViaProxy(proxy, url, headers);
 
-      if (result.status === 403 || result.status === 429) {
-        // CF-blocked — this proxy is flagged, kill it
+      if (result.status === 429) {
+        await markProxyFailed(kv, proxy);
+        await sleep(2000);
+        continue;
+      }
+
+      if (result.status === 403) {
         await markProxyFailed(kv, proxy);
         continue;
       }
@@ -58,15 +79,22 @@ export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
         continue;
       }
 
+      if (isCfChallenge(result.body)) {
+        // Proxy's IP is CF-challenged — kill proxy and retry
+        await markProxyFailed(kv, proxy);
+        throw new CfBlockedError(url);
+      }
+
       await markProxyOk(kv, proxy);
       return result.body;
-    } catch {
+    } catch (e) {
+      if (e instanceof CfBlockedError) throw e;
       await markProxyFailed(kv, proxy);
       // try next proxy
     }
   }
 
-  throw new Error("All proxy attempts failed for " + url);
+  throw new Error(`All ${MAX_RETRIES} proxy attempts failed for ${url}`);
 }
 
 // --- search -------------------------------------------------------------
@@ -97,6 +125,15 @@ export async function searchApps(kv: KVNamespace, query: string): Promise<AppRes
       results.push({ name, developer: dev ?? "Unknown", url: BASE + href });
     }
   }
+
+  if (!results.length) {
+    // Distinguish: valid page with no results vs broken parsing
+    const pageIsValid = html.includes("apkmirror") || html.includes("APKMirror");
+    if (!pageIsValid) {
+      console.warn("apkmirror: searchApps got unexpected HTML for query:", query);
+    }
+  }
+
   return results;
 }
 
@@ -143,13 +180,20 @@ export async function getVariants(kv: KVNamespace, appUrl: string): Promise<Vari
 export async function resolveDownload(kv: KVNamespace, downloadPageUrl: string): Promise<string | null> {
   const html = await anonFetch(kv, downloadPageUrl);
 
-  const re = /id="download-link"[^>]*href="([^"]+)"/;
-  const m = re.exec(html);
-  if (m) return m[1].startsWith("http") ? m[1] : BASE + m[1];
+  // Primary patterns
+  const re1 = /id="download-link"[^>]*href="([^"]+)"/;
+  const m1 = re1.exec(html);
+  if (m1) return m1[1].startsWith("http") ? m1[1] : BASE + m1[1];
 
   const re2 = /class="[^"]*downloadButton[^"]*"[^>]*href="([^"]+)"/;
   const m2 = re2.exec(html);
   if (m2) return m2[1].startsWith("http") ? m2[1] : BASE + m2[1];
 
+  // Fallback: any href with downloadVariant or /APK/ pattern
+  const re3 = /href="([^"]*(?:downloadVariant|\/APK\/)[^"]*)"/i;
+  const m3 = re3.exec(html);
+  if (m3) return m3[1].startsWith("http") ? m3[1] : BASE + m3[1];
+
+  console.warn("apkmirror: resolveDownload found no link at", downloadPageUrl);
   return null;
 }

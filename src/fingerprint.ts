@@ -1,5 +1,3 @@
-// Generates a randomized but internally consistent browser fingerprint per request.
-
 interface BrowserProfile {
   ua: string;
   secChUa: string;
@@ -8,7 +6,7 @@ interface BrowserProfile {
   acceptLanguage: string;
   acceptEncoding: string;
   accept: string;
-  platform: string; // navigator.platform equivalent
+  dnt?: string;
 }
 
 const CHROME_VERSIONS = [
@@ -22,7 +20,6 @@ const CHROME_VERSIONS = [
 const WINDOWS_VERSIONS = [
   "Windows NT 10.0; Win64; x64",
   "Windows NT 10.0; WOW64",
-  "Windows NT 11.0; Win64; x64",
 ];
 
 const MACOS_VERSIONS = [
@@ -49,37 +46,49 @@ function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+// Real Chrome varies the order of brands in Sec-CH-UA
+function buildSecChUa(major: string): string {
+  const brands = [
+    `"Chromium";v="${major}"`,
+    `"Google Chrome";v="${major}"`,
+    `"Not-A.Brand";v="99"`,
+  ];
+  // Shuffle brands — real Chrome does this
+  for (let i = brands.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [brands[i], brands[j]] = [brands[j], brands[i]];
+  }
+  return brands.join(", ");
+}
+
 export function generateFingerprint(): BrowserProfile {
   const chrome = pick(CHROME_VERSIONS);
 
-  // 60% Windows, 25% Mac, 15% Linux
   const r = Math.random();
   let osStr: string;
-  let platform: string;
+  let osPlatform: string;
   if (r < 0.60) {
     osStr = pick(WINDOWS_VERSIONS);
-    platform = "Win32";
+    osPlatform = "Windows";
   } else if (r < 0.85) {
     osStr = pick(MACOS_VERSIONS);
-    platform = "MacIntel";
+    osPlatform = "macOS";
   } else {
     osStr = pick(LINUX_VERSIONS);
-    platform = "Linux x86_64";
+    osPlatform = "Linux";
   }
 
   const ua = `Mozilla/5.0 (${osStr}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chrome.full} Safari/537.36`;
 
-  const secChUa = `"Chromium";v="${chrome.major}", "Google Chrome";v="${chrome.major}", "Not-A.Brand";v="99"`;
-
   return {
     ua,
-    secChUa,
-    secChUaPlatform: `"${platform === "Win32" ? "Windows" : platform === "MacIntel" ? "macOS" : "Linux"}"`,
+    secChUa: buildSecChUa(chrome.major),
+    secChUaPlatform: `"${osPlatform}"`,
     secChUaMobile: "?0",
     acceptLanguage: pick(LANGUAGES),
     acceptEncoding: "gzip, deflate, br",
     accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    platform,
+    dnt: Math.random() < 0.30 ? "1" : undefined,
   };
 }
 
@@ -100,5 +109,6 @@ export function buildHeaders(fp: BrowserProfile, referer?: string): Record<strin
     "Cache-Control": "max-age=0",
   };
   if (referer) h["Referer"] = referer;
+  if (fp.dnt) h["DNT"] = fp.dnt;
   return h;
 }
