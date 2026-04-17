@@ -464,22 +464,19 @@ export async function getVariants(
 // Returns a signed CDN URL (winudf.com) for the latest APK.
 
 async function fetchApkPureUrl(packageName: string, arch: "arm64" | "armeabi"): Promise<string | null> {
-  const archParam = arch === "arm64" ? "arm64-v8a" : "armeabi-v7a";
-  // APKPure download URL - follows redirect to CDN
-  const url = `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest&arch=${archParam}`;
+  // APKPure redirects to a signed winudf.com CDN URL — follow the redirect and return the final URL
+  const url = `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest`;
   const res = await fetch(url, {
-    headers: { "User-Agent": BROWSER_UA, "Referer": "https://apkpure.net/" },
-    redirect: "manual",
+    headers: {
+      "User-Agent": BROWSER_UA,
+      "Referer": "https://apkpure.net/",
+    },
+    redirect: "follow",  // follow the 302 to get the signed CDN URL
     cf: { cacheTtl: 0 },
   });
-  // APKPure returns 302 with the actual download URL in Location header
-  const location = res.headers.get("location");
-  if (location && location.includes("winudf.com")) return location;
-  // Some variants return 200 with a redirect URL in body
-  if (res.ok) {
-    const text = await res.text().catch(() => "");
-    const m = text.match(/https:\/\/[^\s"'<>]+winudf\.com[^\s"'<>]+/);
-    if (m) return m[0];
+  // After following redirect, res.url is the final signed CDN URL
+  if (res.ok && res.url && res.url.includes("winudf.com")) {
+    return res.url;
   }
   return null;
 }

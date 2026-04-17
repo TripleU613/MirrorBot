@@ -80,13 +80,11 @@ const errKb = (back: string, retry?: string): InlineKeyboard => [
 const WELCOME =
   `👋 <b>APK Mirror Bot</b>\n\n` +
   `Download APKs directly from Google Play.\n\n` +
-  `<blockquote expandable>` +
   `<b>How to use:</b>\n` +
   `• Type any app name — <i>whatsapp, chrome, spotify</i>\n` +
   `• Or a package ID — <code>com.whatsapp</code>\n` +
-  `• Use /info to look up any app by package name\n` +
-  `• Works inline — type <code>@JtechMirrorBot</code> in any chat` +
-  `</blockquote>`;
+  `• /info &lt;package&gt; — quick app info\n` +
+  `• Works inline — type <code>@JtechMirrorBot</code> in any chat`;
 
 const resultsText = (q: string) =>
   `🔍 <b>Results for "${esc(q)}"</b>\n\nTap an app to see download options.`;
@@ -104,7 +102,7 @@ function downloadText(v: Variant, appName: string): string {
 
   return (
     `⬇️  <b>${esc(appName)}</b>\n\n` +
-    `<blockquote>${details}</blockquote>\n` +
+    `${details}\n` +
     (v.isSplit ? `\n<i>Split APK — use SAI or similar to install all parts.</i>\n` : "") +
     `\nTap below to download.`
   );
