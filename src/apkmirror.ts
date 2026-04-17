@@ -6,6 +6,11 @@ const MIN_GAP_MS = 1500;
 
 export type ProgressFn = (text: string) => Promise<void>;
 
+export interface BypassConfig {
+  scraperApiKey?: string;  // scraperapi.com API key
+  fsUrl?: string;          // FlareSolverr base URL (e.g. via Cloudflare Tunnel)
+}
+
 export class CfBlockedError extends Error {
   constructor(url: string) { super(`CF challenge on ${url}`); this.name = "CfBlockedError"; }
 }
@@ -30,8 +35,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// --- CF challenge detection ---------------------------------------------
-
 function isCfChallenge(html: string): boolean {
   return (
     html.includes("cf-challenge") ||
@@ -42,8 +45,38 @@ function isCfChallenge(html: string): boolean {
   );
 }
 
-// --- core fetch ---------------------------------------------------------
+// --- Bypass methods -----------------------------------------------------
 
+// FlareSolverr: real Chrome browser, solves any CF challenge
+async function fetchViaFlareSolverr(fsUrl: string, url: string): Promise<string> {
+  const res = await fetch(`${fsUrl}/v1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cmd: "request.get", url, maxTimeout: 60000 }),
+  });
+  if (!res.ok) throw new Error(`FlareSolverr HTTP ${res.status}`);
+  const data = await res.json() as { solution?: { response?: string; status?: number } };
+  const html = data.solution?.response ?? "";
+  if (!html) throw new Error("FlareSolverr returned empty response");
+  if (isCfChallenge(html)) throw new CfBlockedError(url);
+  return html;
+}
+
+// ScraperAPI: managed scraping service, handles CF bypass
+async function fetchViaScraperApi(apiKey: string, url: string): Promise<string> {
+  const apiUrl = `https://api.scraperapi.com/?api_key=${apiKey}&url=${encodeURIComponent(url)}&render=false`;
+  const fp = generateFingerprint();
+  const res = await fetch(apiUrl, {
+    headers: { "User-Agent": fp.ua },
+    cf: { cacheTtl: 0 },
+  });
+  if (!res.ok) throw new Error(`ScraperAPI HTTP ${res.status}`);
+  const html = await res.text();
+  if (isCfChallenge(html)) throw new CfBlockedError(url);
+  return html;
+}
+
+// Direct fetch with browser fingerprint (fallback)
 async function directFetch(url: string): Promise<string> {
   const fp = generateFingerprint();
   const headers = buildHeaders(fp);
@@ -54,29 +87,56 @@ async function directFetch(url: string): Promise<string> {
   return html;
 }
 
-// Direct-first strategy:
-// 1. Try direct fetch immediately — fast (1-2s), often works CF→CF
-// 2. Only if 403/challenged: try up to 2 proxies as fallback
-// This avoids the old problem of spending 32s on dead proxy retries.
+// --- Core fetch: bypass-first strategy ----------------------------------
+//
+// Priority:
+//   1. FlareSolverr (if FS_URL set) — real Chrome, 100% reliable
+//   2. ScraperAPI  (if SCRAPER_API_KEY set) — managed bypass, very reliable
+//   3. Proxy pool  (free HTTP proxies) — unreliable but free
+//   4. Direct      (CF Workers fetch) — often blocked, last resort
+
 export async function anonFetch(
   kv: KVNamespace,
   url: string,
+  bypass: BypassConfig = {},
   onProgress?: ProgressFn
 ): Promise<string> {
   await waitForSlot(kv);
 
-  // Step 1: direct fetch
+  // 1. FlareSolverr
+  if (bypass.fsUrl) {
+    try {
+      const html = await fetchViaFlareSolverr(bypass.fsUrl, url);
+      return html;
+    } catch (e) {
+      console.warn("anonFetch: FlareSolverr failed:", e);
+      await onProgress?.("retrying via backup route…");
+    }
+  }
+
+  // 2. ScraperAPI
+  if (bypass.scraperApiKey) {
+    try {
+      const html = await fetchViaScraperApi(bypass.scraperApiKey, url);
+      return html;
+    } catch (e) {
+      console.warn("anonFetch: ScraperAPI failed:", e);
+      await onProgress?.("routing around a block…");
+    }
+  }
+
+  // 3. Direct fetch (fast, sometimes works CF→CF)
   try {
     return await directFetch(url);
   } catch (e) {
     const blocked = e instanceof CfBlockedError ||
       (e instanceof Error && /HTTP 403|HTTP 429/.test(e.message));
-    if (!blocked) throw e; // unexpected error — propagate
-    console.warn(`anonFetch: direct blocked (${e instanceof Error ? e.message : e}), trying proxies`);
+    if (!blocked) throw e;
+    console.warn(`anonFetch: direct blocked, trying proxies`);
     await onProgress?.("routing around a block…");
   }
 
-  // Step 2: proxy fallback (max 2 attempts)
+  // 4. Proxy fallback (max 2 attempts)
   for (let attempt = 0; attempt < 2; attempt++) {
     const fp = generateFingerprint();
     const headers = buildHeaders(fp, BASE + "/");
@@ -85,18 +145,15 @@ export async function anonFetch(
 
     try {
       const result = await fetchViaProxy(proxy, url, headers);
-
       if (result.status === 403 || result.status === 429 || !result.ok) {
         await markProxyFailed(kv, proxy);
         if (attempt === 0) await onProgress?.("trying another route…");
         continue;
       }
-
       if (isCfChallenge(result.body)) {
         await markProxyFailed(kv, proxy);
         continue;
       }
-
       await markProxyOk(kv, proxy);
       return result.body;
     } catch {
@@ -118,10 +175,11 @@ export interface AppResult {
 export async function searchApps(
   kv: KVNamespace,
   query: string,
+  bypass: BypassConfig = {},
   onProgress?: ProgressFn
 ): Promise<AppResult[]> {
-  const url = `${BASE}/?post_type=app_release&searchtype=app&s=${encodeURIComponent(query)}`;
-  const html = await anonFetch(kv, url, onProgress);
+  const url = `${BASE}/?post_type=app_release&searchtype=apk&bundles[]=apk_files&bundles[]=apkm_bundles&s=${encodeURIComponent(query)}`;
+  const html = await anonFetch(kv, url, bypass, onProgress);
 
   const results: AppResult[] = [];
   const rowRe = /<div class="[^"]*appRow[^"]*"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/g;
@@ -160,9 +218,10 @@ export interface Variant {
 export async function getVariants(
   kv: KVNamespace,
   appUrl: string,
+  bypass: BypassConfig = {},
   onProgress?: ProgressFn
 ): Promise<Variant[]> {
-  const html = await anonFetch(kv, appUrl, onProgress);
+  const html = await anonFetch(kv, appUrl, bypass, onProgress);
 
   const variants: Variant[] = [];
   const rowRe = /<div class="table-row headerFont"[\s\S]*?(?=<div class="table-row headerFont"|<\/div>\s*<\/div>\s*<\/div>)/g;
@@ -194,9 +253,10 @@ export async function getVariants(
 export async function resolveDownload(
   kv: KVNamespace,
   downloadPageUrl: string,
+  bypass: BypassConfig = {},
   onProgress?: ProgressFn
 ): Promise<string | null> {
-  const html = await anonFetch(kv, downloadPageUrl, onProgress);
+  const html = await anonFetch(kv, downloadPageUrl, bypass, onProgress);
 
   const re1 = /id="download-link"[^>]*href="([^"]+)"/;
   const m1 = re1.exec(html);

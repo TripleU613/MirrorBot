@@ -5,12 +5,14 @@ import {
 } from "./telegram";
 import {
   searchApps, getVariants, resolveDownload,
-  CfBlockedError, AppResult, Variant, ProgressFn,
+  CfBlockedError, AppResult, Variant, ProgressFn, BypassConfig,
 } from "./apkmirror";
 
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   RATE_KV: KVNamespace;
+  SCRAPER_API_KEY?: string;  // optional: scraperapi.com free key (1000/month) for CF bypass
+  FS_URL?: string;           // optional: FlareSolverr URL (e.g. via Cloudflare Tunnel)
 }
 
 interface ExecutionContext {
@@ -38,6 +40,12 @@ async function saveSession(kv: KVNamespace, chatId: number, s: Session): Promise
   } catch (e) {
     console.warn("saveSession failed:", e);
   }
+}
+
+// --- Bypass config from env --------------------------------------------
+
+function bypassCfg(env: Env): BypassConfig {
+  return { scraperApiKey: env.SCRAPER_API_KEY, fsUrl: env.FS_URL };
 }
 
 // --- Progress helper ----------------------------------------------------
@@ -193,7 +201,7 @@ async function handleMessage(
     const mid = await sendMessageGetId(env.TELEGRAM_BOT_TOKEN, chatId, `🔗 Resolving download link…`);
     const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, mid, "🔗 Resolving…");
     try {
-      const link = await resolveDownload(env.RATE_KV, dlUrl, onProgress);
+      const link = await resolveDownload(env.RATE_KV, dlUrl, bypassCfg(env), onProgress);
       if (link) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, mid, "✅ Here's your link:", [[{ text: "⬇️  Download APK", url: link }]]);
       } else {
@@ -218,7 +226,7 @@ async function handleMessage(
   const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔍 Searching for <b>${esc(query)}</b>…`);
 
   try {
-    const results = await searchApps(env.RATE_KV, query, onProgress);
+    const results = await searchApps(env.RATE_KV, query, bypassCfg(env), onProgress);
 
     if (!results.length) {
       await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
@@ -269,7 +277,7 @@ async function handleCallback(
       `🔍 Searching APKMirror for <b>${esc(query)}</b>…`);
     const onProgress = makeProgress(env.TELEGRAM_BOT_TOKEN, chatId, messageId, `🔍 Searching for <b>${esc(query)}</b>…`);
     try {
-      const results = await searchApps(env.RATE_KV, query, onProgress);
+      const results = await searchApps(env.RATE_KV, query, bypassCfg(env), onProgress);
       if (!results.length) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
           `😕 Still no results for "<b>${esc(query)}</b>". Try a different name.`);
@@ -316,7 +324,7 @@ async function handleCallback(
       `🔄 Loading variants for <b>${esc(app.name)}</b>…`);
 
     try {
-      const variants = await getVariants(env.RATE_KV, app.url, onProgress);
+      const variants = await getVariants(env.RATE_KV, app.url, bypassCfg(env), onProgress);
 
       if (!variants.length) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
@@ -358,7 +366,7 @@ async function handleCallback(
       `🔄 Resolving download for <b>${esc(session.appName)}</b> v${esc(variant.version)}…`);
 
     try {
-      const link = await resolveDownload(env.RATE_KV, variant.downloadPageUrl, onProgress);
+      const link = await resolveDownload(env.RATE_KV, variant.downloadPageUrl, bypassCfg(env), onProgress);
 
       if (!link) {
         await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
