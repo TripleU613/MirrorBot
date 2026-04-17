@@ -146,6 +146,38 @@ export async function sendTyping(token: string, chatId: number): Promise<void> {
 
 // ─── Inline queries ──────────────────────────────────────────────────────────
 
+export async function sendDocument(
+  token: string,
+  chatId: number,
+  documentUrl: string,
+  caption?: string
+): Promise<{ ok: boolean; fileSize?: number }> {
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    document: documentUrl,
+    disable_notification: false,
+  };
+  if (caption) { body.caption = caption; body.parse_mode = "HTML"; }
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      const d = await res.json() as { result?: { document?: { file_size?: number } } };
+      return { ok: true, fileSize: d.result?.document?.file_size };
+    }
+    const err = await res.json().catch(() => ({})) as Record<string, unknown>;
+    console.warn("sendDocument failed:", res.status, err);
+    return { ok: false };
+  } catch (e) {
+    console.warn("sendDocument error:", e);
+    return { ok: false };
+  }
+}
+
 export async function answerInlineQuery(
   token: string, queryId: string, results: InlineQueryResult[],
   opts?: { cacheTime?: number; nextOffset?: string; switchPmText?: string; switchPmParam?: string }

@@ -1,6 +1,6 @@
 import {
   sendMessage, sendMessageGetId, editMessage, answerCallback,
-  sendTyping, setupBot, TelegramUpdate, InlineKeyboard,
+  sendTyping, setupBot, sendDocument, TelegramUpdate, InlineKeyboard,
   answerInlineQuery, InlineQueryResult,
 } from "./telegram";
 import {
@@ -477,13 +477,42 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
       chatId, msgId, env, undefined, undefined, `pkg:${pkg}`);
   }
 
-  // Pick a variant
+  // Pick a variant → send APK as Telegram file
   if (data.startsWith("v:")) {
     if (session.step !== "variants") return;
     const variant = session.variants[parseInt(data.slice(2), 10)];
     if (!variant) return;
+
+    const appName = session.appName;
+    const archLabel = variant.arch === "arm64-v8a" ? "arm64" : "armv7";
+
+    // Show loading message
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
-      downloadText(variant, session.appName), downloadKb(variant));
+      `⏳ <b>Sending ${esc(appName)}</b> (${archLabel})…\n\n<i>Downloading and uploading to Telegram…</i>`);
+
+    // Try to send as Telegram document (Telegram downloads from URL)
+    const caption =
+      `📦 <b>${esc(appName)}</b>\n` +
+      `Architecture: <code>${esc(variant.arch)}</code>\n` +
+      (variant.versionCode ? `Build: <code>${variant.versionCode}</code>\n` : "") +
+      `\n<i>via APK Mirror Bot</i>`;
+
+    const result = await sendDocument(env.TELEGRAM_BOT_TOKEN, chatId, variant.downloadUrl, caption);
+
+    if (result.ok) {
+      // File sent — update loading message
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
+        `✅ <b>${esc(appName)}</b> (${archLabel}) sent above ↑`,
+        [[{ text: "← Back to variants", callback_data: "back2" }]]);
+    } else {
+      // File too large or error — fall back to direct download link
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
+        `📥 <b>${esc(appName)}</b> (${archLabel})\n\nTap below to download:`,
+        [
+          [{ text: "⬇️  Download APK", url: variant.downloadUrl }],
+          [{ text: "← Back to variants", callback_data: "back2" }],
+        ]);
+    }
     return;
   }
 }
