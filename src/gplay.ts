@@ -23,6 +23,7 @@ const AUTH_KV_KEY = "gplay_auth_v3";
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.119 Safari/537.36";
 // Encoded targets for delivery response (what fields to include)
 const DFE_ENCODED_TARGETS = "CAESN/qigQYC2AMBFfUbyA7SM5Ij/CvfBoIDgxXrBPsDlQUdMfOLAfoFrwEHgAcBrQYhoA0cGt4MKK0Y2gI";
+const DFE_PHENOTYPE = "H4sIAAAAAAAAAB3OO3KjMAAA0KRNuWXukBkBQkAJ2MhgAZb5u2GCwQZbCH_EJ77QHmgvtDtbv-Z9_H63zXXU0NVPB1odlyGy7751Q3CitlPDvFd8lxhz3tpNmz7P92CFw73zdHU2Ie0Ad2kmR8lxhiErTFLt3RPGfJQHSDy7Clw10bg8kqf2owLokN4SecJTLoSwBnzQSd652_MOf2d1vKBNVedzg4ciPoLz2mQ8efGAgYeLou-l-PXn_7Sna1MfhHuySxt-4esulEDp8Sbq54CPPKjpANW-lkU2IZ0F92LBI-ukCKSptqeq1eXU96LD9nZfhKHdtjSWwJqUm_2r6pMHOxk01saVanmNopjX3YxQafC4iC6T55aRbC8nTI98AF_kItIQAJb5EQxnKTO7TZDWnr01HVPxelb9A2OWX6poidMWl16K54kcu_jhXw-JSBQkVcD_fPsLSZu6joIBAAA";
 
 // ─── Auth storage ─────────────────────────────────────────────────────────────
 
@@ -134,6 +135,7 @@ export async function acquireToken(arch: "arm64" | "armeabi"): Promise<AcquiredA
 
   const data = await res.json() as {
     authToken?: string;
+    aasToken?: string;
     gsfId?: string;
     dfeCookie?: string;
     deviceCheckInConsistencyToken?: string;
@@ -141,16 +143,54 @@ export async function acquireToken(arch: "arm64" | "armeabi"): Promise<AcquiredA
     deviceInfoProvider?: { userAgentString?: string; mccMnc?: string };
   };
 
-  const tok = data.authToken;
-  if (!tok) throw new GPlayError("AuroraStore returned no authToken");
+  if (!data.authToken && !data.aasToken) throw new GPlayError("AuroraStore returned no token");
+
+  const gsfId = data.gsfId ?? "";
+  const userAgent = data.deviceInfoProvider?.userAgentString
+    ?? `Android-Finsky/${profile["Vending.versionString"]} (api=3,versionCode=${profile["Vending.version"]},sdk=${profile["Build.VERSION.SDK_INT"]},device=${profile["Build.DEVICE"]},hardware=${profile["Build.HARDWARE"]},product=${profile["Build.PRODUCT"]},platformVersionRelease=${profile["Build.VERSION.RELEASE"]},model=${encodeURIComponent(profile["Build.MODEL"] ?? "")},buildId=${profile["Build.ID"]},isWideScreen=0,supportedAbis=${profile["Platforms"]})`;
+  const mccMnc = data.deviceInfoProvider?.mccMnc ?? "310260";
+
+  // If we have an aasToken, exchange it for the FDFE-compatible auth token
+  let fdfeToken = data.authToken ?? "";
+  if (data.aasToken) {
+    try {
+      const exchangeBody = new URLSearchParams({
+        Token: data.aasToken,
+        service: "androidmarket",
+        source: "android",
+        androidId: gsfId,
+        app: "com.android.vending",
+        device_country: "us",
+        operatorCountry: "us",
+        lang: "en",
+        sdk_version: profile["Build.VERSION.SDK_INT"] ?? "33",
+      });
+      const exchRes = await fetch("https://android.clients.google.com/auth", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": userAgent,
+        },
+        body: exchangeBody.toString(),
+        cf: { cacheTtl: 0 },
+      });
+      if (exchRes.ok) {
+        const exchText = await exchRes.text();
+        const authMatch = exchText.match(/^Auth=(.+)$/m);
+        if (authMatch) fdfeToken = authMatch[1];
+      }
+    } catch { /* use authToken fallback */ }
+  }
+
+  const tok = fdfeToken || data.authToken;
+  if (!tok) throw new GPlayError("Could not obtain FDFE auth token");
 
   return {
     authToken: tok,
-    gsfId: data.gsfId ?? profile["GSF.version"] ?? "",
+    gsfId,
     dfeCookie: data.dfeCookie,
-    userAgent: data.deviceInfoProvider?.userAgentString
-      ?? `Android-Finsky/${profile["Vending.versionString"]} (api=3,versionCode=${profile["Vending.version"]},sdk=${profile["Build.VERSION.SDK_INT"]},device=${profile["Build.DEVICE"]},hardware=${profile["Build.HARDWARE"]},product=${profile["Build.PRODUCT"]},platformVersionRelease=${profile["Build.VERSION.RELEASE"]},model=${encodeURIComponent(profile["Build.MODEL"] ?? "")},buildId=${profile["Build.ID"]},isWideScreen=0,supportedAbis=${profile["Platforms"]})`,
-    mccMnc: data.deviceInfoProvider?.mccMnc ?? "310260",
+    userAgent,
+    mccMnc,
     deviceCheckInToken: data.deviceCheckInConsistencyToken,
     deviceConfigToken: data.deviceConfigToken,
   };
@@ -185,8 +225,12 @@ export async function getStoredToken(kv: KVNamespace, arch: "arm64" | "armeabi")
 }
 
 function buildHeaders(session: AuthSession): Record<string, string> {
+  // ya29.xxx = OAuth2 Bearer token; anything else = old-style GoogleLogin auth token
+  const authHeader = session.authToken.startsWith("ya29.")
+    ? `Bearer ${session.authToken}`
+    : `GoogleLogin auth=${session.authToken}`;
   const h: Record<string, string> = {
-    "Authorization": `Bearer ${session.authToken}`,
+    "Authorization": authHeader,
     "User-Agent": session.userAgent,
     "X-DFE-Device-Id": session.gsfId,
     "X-DFE-Client-Id": "am-android-google",
@@ -194,6 +238,8 @@ function buildHeaders(session: AuthSession): Record<string, string> {
     "X-DFE-Content-Filters": "",
     "X-DFE-Request-Params": "timeoutMs=4000",
     "X-DFE-Encoded-Targets": DFE_ENCODED_TARGETS,
+    "X-DFE-Phenotype": DFE_PHENOTYPE,
+    "X-DFE-Filter-Level": "3",
     "Accept-Language": "en-US",
     "X-DFE-UserLanguages": "en_US",
     "X-Limit-Ad-Tracking-Enabled": "false",
@@ -376,20 +422,66 @@ export async function getVariants(
 
   await onProgress?.("fetching download info…");
 
+  // Try FDFE delivery first (Google Play CDN), fall back to APKPure
   const tasks: Promise<Variant | null>[] = [];
   if (s64) tasks.push(fetchDelivery(packageName, s64, "arm64"));
   if (s32) tasks.push(fetchDelivery(packageName, s32, "armeabi"));
 
   const results = await Promise.allSettled(tasks);
-
-  // Check if token expired
-  const expired = results.filter(r => r.status === "rejected" && r.reason instanceof TokenExpiredError);
-  if (expired.length === tasks.length) throw new TokenExpiredError();
-
-  return results
+  const fdfeVariants = results
     .filter((r): r is PromiseFulfilledResult<Variant | null> => r.status === "fulfilled")
     .map(r => r.value)
     .filter((v): v is Variant => v !== null);
+
+  if (fdfeVariants.length > 0) return fdfeVariants;
+
+  // FDFE delivery unavailable — fall back to APKPure
+  await onProgress?.("trying alternative source…");
+  const apkpureResults = await Promise.all([
+    fetchApkPureUrl(packageName, "arm64"),
+    fetchApkPureUrl(packageName, "armeabi"),
+  ]);
+
+  const apkpureVariants: Variant[] = [];
+  const archs = ["arm64", "armeabi"] as const;
+  apkpureResults.forEach((url, i) => {
+    if (!url) return;
+    const arch = archs[i];
+    apkpureVariants.push({
+      arch: arch === "arm64" ? "arm64-v8a" : "armeabi-v7a",
+      packageName,
+      label: arch === "arm64" ? "arm64 · modern phones" : "armv7 · older phones",
+      downloadUrl: url,
+      isSplit: false,
+    });
+  });
+
+  return apkpureVariants;
+}
+
+// ─── APKPure download fallback ───────────────────────────────────────────────
+// APKPure's d.apkpure.net API is not CF-protected and accessible from Workers.
+// Returns a signed CDN URL (winudf.com) for the latest APK.
+
+async function fetchApkPureUrl(packageName: string, arch: "arm64" | "armeabi"): Promise<string | null> {
+  const archParam = arch === "arm64" ? "arm64-v8a" : "armeabi-v7a";
+  // APKPure download URL - follows redirect to CDN
+  const url = `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest&arch=${archParam}`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": BROWSER_UA, "Referer": "https://apkpure.net/" },
+    redirect: "manual",
+    cf: { cacheTtl: 0 },
+  });
+  // APKPure returns 302 with the actual download URL in Location header
+  const location = res.headers.get("location");
+  if (location && location.includes("winudf.com")) return location;
+  // Some variants return 200 with a redirect URL in body
+  if (res.ok) {
+    const text = await res.text().catch(() => "");
+    const m = text.match(/https:\/\/[^\s"'<>]+winudf\.com[^\s"'<>]+/);
+    if (m) return m[0];
+  }
+  return null;
 }
 
 async function fetchDelivery(
@@ -399,36 +491,70 @@ async function fetchDelivery(
 ): Promise<Variant | null> {
   const headers = buildHeaders(session);
 
-  // Step 1: Purchase (required to get delivery token for free apps)
-  const enc = new TextEncoder();
-  const pkgBytes = enc.encode(packageName);
-  const purchaseBody = new Uint8Array([
-    0x0a, pkgBytes.length, ...pkgBytes,  // field 1: docId
-    0x10, 0x01,                           // field 2: offerType=1 (free)
-    0x18, 0x00,                           // field 3: ver=0
-  ]);
-
+  // Step 1: Get version code from details API
+  let versionCode = 0;
   try {
-    await fetch("https://android.clients.google.com/fdfe/purchase", {
+    const detRes = await fetch(
+      `https://android.clients.google.com/fdfe/details?doc=${encodeURIComponent(packageName)}`,
+      { method: "GET", headers, cf: { cacheTtl: 300 } }
+    );
+    if (detRes.ok) {
+      const detBuf = new Uint8Array(await detRes.arrayBuffer());
+      const detTop = decodeProto(detBuf);
+      // payload field 2 → detailsResponse → docV2 → details → appDetails → versionCode
+      const detPayload = pBytes(detTop, 2);
+      if (detPayload) {
+        const dp = decodeProto(detPayload);
+        // detailsResponse at field 2, docV2 at field 4, details at field 13, appDetails at field 1, versionCode at field 3
+        const drBytes = pBytes(dp, 2);
+        if (drBytes) {
+          const dr = decodeProto(drBytes);
+          const docBytes = pBytes(dr, 4) ?? pBytes(dr, 2) ?? pBytes(dr, 1);
+          if (docBytes) {
+            const doc = decodeProto(docBytes);
+            const detailBytes = pBytes(doc, 13) ?? pBytes(doc, 11);
+            if (detailBytes) {
+              const det = decodeProto(detailBytes);
+              const appDetBytes = pBytes(det, 1);
+              if (appDetBytes) {
+                const appDet = decodeProto(appDetBytes);
+                versionCode = pInt(appDet, 3);
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch { /* use vc=0 */ }
+
+  // Step 2: Purchase — POST, extract download token from response
+  const vcParam = versionCode > 0 ? versionCode : 0;
+  let downloadToken = "";
+  try {
+    const pRes = await fetch("https://android.clients.google.com/fdfe/purchase", {
       method: "POST",
-      headers: { ...headers, "Content-Type": "application/x-protobuf" },
-      body: purchaseBody,
+      headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+      body: `doc=${encodeURIComponent(packageName)}&ot=1&vc=${vcParam}`,
       cf: { cacheTtl: 0 },
     });
-    // Ignore purchase response — just needed to "activate" the download
+    const pBuf = new Uint8Array(await pRes.arrayBuffer());
+    const top = decodeProto(pBuf);
+    const payload = pBytes(top, 1);
+    if (payload) {
+      const buyResp = pBytes(decodeProto(payload), 4);
+      if (buyResp) {
+        const buy = decodeProto(buyResp);
+          downloadToken = pStr(buy, 55) || pStr(buy, 56) || "";
+      }
+    }
   } catch { /* continue to delivery anyway */ }
 
-  // Step 2: Delivery
-  const deliveryBody = new Uint8Array([
-    0x0a, pkgBytes.length, ...pkgBytes,  // field 1: docId
-    0x18, 0x00,                           // field 3: versionCode=0 (latest)
-    0x28, 0x01,                           // field 5: installSource=1
-  ]);
-
-  const res = await fetch("https://android.clients.google.com/fdfe/delivery", {
-    method: "POST",
-    headers: { ...headers, "Content-Type": "application/x-protobuf" },
-    body: deliveryBody,
+  // Step 3: Delivery — GET, include download token if we have it
+  const dtokParam = downloadToken ? `&dtok=${encodeURIComponent(downloadToken)}` : "";
+  const deliveryUrl = `https://android.clients.google.com/fdfe/delivery?doc=${encodeURIComponent(packageName)}&ot=1&vc=${vcParam}&isInstall=1${dtokParam}`;
+  const res = await fetch(deliveryUrl, {
+    method: "GET",
+    headers,
     cf: { cacheTtl: 0 },
   });
 
@@ -510,6 +636,105 @@ export async function getAppInfo(packageName: string): Promise<AppInfo | null> {
     developer: meta.developer,
     icon: meta.icon,
     version: meta.version,
+  };
+}
+
+// ─── Debug delivery ─────────────────────────────────────────────────────────
+
+export async function debugDelivery(kv: KVNamespace, packageName: string): Promise<unknown> {
+  const session = await getSession(kv, "arm64");
+  if (!session) return { error: "no token" };
+
+  const headers = buildHeaders(session);
+  const enc = new TextEncoder();
+  const pkgBytes = enc.encode(packageName);
+
+  // Get version code first
+  let vc = 0;
+  const detRes = await fetch(
+    `https://android.clients.google.com/fdfe/details?doc=${encodeURIComponent(packageName)}`,
+    { method: "GET", headers }
+  );
+  const detBuf = new Uint8Array(await detRes.arrayBuffer());
+  const detHex = Array.from(detBuf.slice(0, 100)).map(b => b.toString(16).padStart(2,"0")).join(" ");
+
+  // Try alternate auth format: GoogleLogin auth= instead of Bearer
+  const headersGoogleLogin = {
+    ...headers,
+    "Authorization": `GoogleLogin auth=${session.authToken}`,
+  };
+
+  const pRes = await fetch("https://android.clients.google.com/fdfe/purchase", {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+    body: `doc=${encodeURIComponent(packageName)}&ot=1&vc=${vc}`,
+  });
+  const purchaseBuf = new Uint8Array(await pRes.arrayBuffer());
+  const purchaseUrlMatch = new TextDecoder().decode(purchaseBuf).match(/https?:\/\/[^\x00-\x1F\x7F]{20,}/g);
+  const purchaseParsed = dumpProto(purchaseBuf);
+
+  // Extract download token from purchase response
+  // Path: ResponseWrapper.field1.field4.field1.field55 (or field56)
+  let downloadToken = "";
+  try {
+    const top = decodeProto(purchaseBuf);
+    const payload = pBytes(top, 1);
+    if (payload) {
+      const buyResp = pBytes(decodeProto(payload), 4);
+      if (buyResp) {
+        const buy = decodeProto(buyResp);
+        downloadToken = pStr(buy, 55) || pStr(buy, 56) || "";
+      }
+    }
+  } catch { /* ignore */ }
+
+  const dtokParam = downloadToken ? `&dtok=${encodeURIComponent(downloadToken)}` : "";
+  const deliveryBase = `https://android.clients.google.com/fdfe/delivery?doc=${encodeURIComponent(packageName)}&ot=1&vc=${vc}&isInstall=1${dtokParam}`;
+
+  // Test Bearer auth
+  const dRes = await fetch(deliveryBase, { method: "GET", headers });
+  const buf = new Uint8Array(await dRes.arrayBuffer());
+
+  // Test GoogleLogin auth format
+  const dResGL = await fetch(deliveryBase, { method: "GET", headers: { ...headers, "Authorization": `GoogleLogin auth=${session.authToken}` } });
+  const bufGL = new Uint8Array(await dResGL.arrayBuffer());
+  const urlMatchGL = new TextDecoder().decode(bufGL).match(/https?:\/\/[^\x00-\x1F\x7F]{10,}/g);
+
+  const hex = Array.from(buf.slice(0, 300)).map(b => b.toString(16).padStart(2, "0")).join(" ");
+  // Try to find any string that looks like a URL
+  const bufStr = new TextDecoder().decode(buf);
+  const urlMatch = bufStr.match(/https?:\/\/[^\x00-\x1F\x7F]{10,}/g);
+
+  function dumpProto(b: Uint8Array, depth = 0): Record<string, unknown> {
+    if (depth > 4) return {};
+    const f = decodeProto(b);
+    const out: Record<string, unknown> = {};
+    for (const [k, vals] of f) {
+      out[String(k)] = vals.map(v => {
+        if (typeof v === "bigint") return Number(v);
+        if (v instanceof Uint8Array) {
+          const s = new TextDecoder().decode(v);
+          const printable = s.replace(/[^\x20-\x7E]/g, "?");
+          if (v.length < 500 && depth < 3) {
+            try { return { _nested: dumpProto(v, depth + 1), _str: printable.slice(0, 80), _len: v.length }; } catch { /**/ }
+          }
+          return `<bytes len=${v.length} str="${printable.slice(0, 80)}">`;
+        }
+        return v;
+      });
+    }
+    return out;
+  }
+
+  const topFields = dumpProto(buf);
+
+  return {
+    details_status: detRes.status,
+    purchase_status: pRes.status,
+    download_token: downloadToken ? downloadToken.slice(0, 20) + "..." : null,
+    bearer_status: dRes.status, bearer_len: buf.length, bearer_urls: urlMatch,
+    googlelogin_status: dResGL.status, googlelogin_len: bufGL.length, googlelogin_urls: urlMatchGL,
+    delivery_parsed: topFields,
   };
 }
 

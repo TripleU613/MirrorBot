@@ -5,7 +5,7 @@ import {
 } from "./telegram";
 import {
   searchApps, getVariants, getAppInfo, resolveDownload,
-  seedToken, getStoredToken, acquireToken,
+  seedToken, getStoredToken, acquireToken, debugDelivery,
   GPlayError, TokenMissingError, TokenExpiredError,
   AppResult, Variant, ProgressFn,
 } from "./gplay";
@@ -231,6 +231,13 @@ export default {
         getStoredToken(env.RATE_KV, "armeabi"),
       ]);
       return Response.json({ arm64: !!arm64, armeabi: !!armeabi });
+    }
+
+    // Debug: GET /debug-delivery?pkg=com.whatsapp
+    if (req.method === "GET" && url.pathname === "/debug-delivery") {
+      const pkg = url.searchParams.get("pkg") ?? "com.whatsapp";
+      const result = await debugDelivery(env.RATE_KV, pkg);
+      return Response.json(result);
     }
 
     // ── Telegram webhook
