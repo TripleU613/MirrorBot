@@ -166,6 +166,30 @@ export default {
       return new Response("ok");
     }
 
+    // Debug: GET /test?url=... — check what status APKMirror returns from this Worker
+    if (req.method === "GET" && url.pathname === "/test") {
+      const target = url.searchParams.get("url") ?? "https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s=chrome";
+      try {
+        const r = await fetch(target, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.119 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+          },
+          cf: { cacheTtl: 0 },
+        });
+        const body = await r.text();
+        const isChallenge = body.includes("Just a moment") || body.includes("cf-challenge");
+        return Response.json({ status: r.status, challenge: isChallenge, bodyLen: body.length, preview: body.slice(0, 200) });
+      } catch (e) {
+        return Response.json({ error: String(e) });
+      }
+    }
+
     return new Response("MirrorBot running.");
   },
 };
