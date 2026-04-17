@@ -4,7 +4,7 @@ import {
   TelegramUpdate, InlineKeyboard,
 } from "./telegram";
 import {
-  searchApps, getVariants, resolveDownload,
+  searchApps, getVariants, resolveDownload, seedToken, getStoredToken,
   GPlayError, AppResult, Variant, ProgressFn,
 } from "./gplay";
 import { refreshVerifiedPool } from "./proxy-pool";
@@ -149,6 +149,26 @@ export default {
     if (req.method === "GET" && url.pathname === "/warmup") {
       ctx.waitUntil(refreshVerifiedPool(env.RATE_KV, 8).catch(() => {}));
       return new Response("ok");
+    }
+
+    // POST /seed-token {"arm64":"TOKEN","armeabi":"TOKEN"}
+    // Call this once with tokens from your local gplay server to enable downloads.
+    if (req.method === "POST" && url.pathname === "/seed-token") {
+      try {
+        const { arm64, armeabi } = await req.json() as { arm64?: string; armeabi?: string };
+        if (!arm64 && !armeabi) return Response.json({ error: "provide arm64 and/or armeabi token" }, { status: 400 });
+        await seedToken(env.RATE_KV, arm64 ?? "", armeabi ?? "");
+        return Response.json({ ok: true, message: "Tokens stored. Downloads enabled." });
+      } catch (e) {
+        return Response.json({ error: String(e) }, { status: 500 });
+      }
+    }
+
+    // GET /token-status — check if tokens are seeded
+    if (req.method === "GET" && url.pathname === "/token-status") {
+      const arm64 = await getStoredToken(env.RATE_KV, "arm64");
+      const armeabi = await getStoredToken(env.RATE_KV, "armeabi");
+      return Response.json({ arm64: !!arm64, armeabi: !!armeabi });
     }
 
     if (req.method === "POST" && url.pathname === "/webhook") {
