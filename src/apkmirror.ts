@@ -43,22 +43,29 @@ function isCfChallenge(html: string): boolean {
 
 // --- core fetch ---------------------------------------------------------
 
+async function directFetch(url: string): Promise<string> {
+  const fp = generateFingerprint();
+  const headers = buildHeaders(fp);
+  const res = await fetch(url, { headers, cf: { cacheTtl: 0, cacheEverything: false } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  const html = await res.text();
+  if (isCfChallenge(html)) throw new CfBlockedError(url);
+  return html;
+}
+
 export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
   await waitForSlot(kv);
+
+  let proxyAttempts = 0;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     const fp = generateFingerprint();
     const headers = buildHeaders(fp, attempt > 0 ? BASE + "/" : undefined);
     const proxy = await getProxy(kv);
 
-    if (!proxy) {
-      // No proxies — direct fetch with rotated fingerprint
-      const res = await fetch(url, { headers, cf: { cacheTtl: 0, cacheEverything: false } });
-      if (!res.ok) throw new Error(`Direct fetch HTTP ${res.status}`);
-      const html = await res.text();
-      if (isCfChallenge(html)) throw new CfBlockedError(url);
-      return html;
-    }
+    if (!proxy) break; // no proxies available — skip to direct
+
+    proxyAttempts++;
 
     try {
       const result = await fetchViaProxy(proxy, url, headers);
@@ -69,32 +76,29 @@ export async function anonFetch(kv: KVNamespace, url: string): Promise<string> {
         continue;
       }
 
-      if (result.status === 403) {
-        await markProxyFailed(kv, proxy);
-        continue;
-      }
-
-      if (!result.ok) {
+      if (result.status === 403 || !result.ok) {
         await markProxyFailed(kv, proxy);
         continue;
       }
 
       if (isCfChallenge(result.body)) {
-        // Proxy's IP is CF-challenged — kill proxy and retry
         await markProxyFailed(kv, proxy);
-        throw new CfBlockedError(url);
+        continue; // try another proxy, don't give up yet
       }
 
       await markProxyOk(kv, proxy);
       return result.body;
     } catch (e) {
-      if (e instanceof CfBlockedError) throw e;
+      if (e instanceof CfBlockedError) { /* try another proxy */ }
       await markProxyFailed(kv, proxy);
-      // try next proxy
     }
   }
 
-  throw new Error(`All ${MAX_RETRIES} proxy attempts failed for ${url}`);
+  // All proxies failed or none available — fall back to direct CF egress.
+  // CF Workers IPs are often trusted by CF-protected sites and this works
+  // well when free proxy pool is exhausted.
+  console.warn(`anonFetch: ${proxyAttempts} proxy attempts failed, falling back to direct fetch for ${url}`);
+  return directFetch(url);
 }
 
 // --- search -------------------------------------------------------------
