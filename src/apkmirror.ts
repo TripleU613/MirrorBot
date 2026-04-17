@@ -7,8 +7,9 @@ const MIN_GAP_MS = 1500;
 export type ProgressFn = (text: string) => Promise<void>;
 
 export interface BypassConfig {
-  scraperApiKey?: string;  // scraperapi.com API key
-  fsUrl?: string;          // FlareSolverr base URL (e.g. via Cloudflare Tunnel)
+  solver?: { fetch: (req: Request) => Promise<Response> }; // mirrorbot-solver service binding
+  scraperApiKey?: string;  // scraperapi.com API key (fallback)
+  fsUrl?: string;          // FlareSolverr via tunnel (fallback)
 }
 
 export class CfBlockedError extends Error {
@@ -103,7 +104,27 @@ export async function anonFetch(
 ): Promise<string> {
   await waitForSlot(kv);
 
-  // 1. FlareSolverr
+  // 1. Solver Worker (Cloudflare Browser Rendering — headless Chrome, always on)
+  if (bypass.solver) {
+    try {
+      const res = await bypass.solver.fetch(
+        new Request("https://solver/fetch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        })
+      );
+      if (res.ok) {
+        const { html } = await res.json() as { html: string };
+        if (html && !isCfChallenge(html)) return html;
+      }
+    } catch (e) {
+      console.warn("anonFetch: solver Worker failed:", e);
+      await onProgress?.("retrying via backup route…");
+    }
+  }
+
+  // 2. FlareSolverr
   if (bypass.fsUrl) {
     try {
       const html = await fetchViaFlareSolverr(bypass.fsUrl, url);

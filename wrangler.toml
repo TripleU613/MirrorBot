@@ -12,5 +12,9 @@ account_id = "2069a0e7348e495373ef64e17cc6ecc1"
 binding = "RATE_KV"
 id = "PLACEHOLDER_KV_ID"          # filled in by deploy workflow on first run
 
+[[services]]
+binding = "SOLVER"
+service = "mirrorbot-solver"
+
 [triggers]
 # Telegram sends webhook POSTs to our worker URL

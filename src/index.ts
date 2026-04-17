@@ -11,8 +11,9 @@ import {
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   RATE_KV: KVNamespace;
-  SCRAPER_API_KEY?: string;  // optional: scraperapi.com free key (1000/month) for CF bypass
-  FS_URL?: string;           // optional: FlareSolverr URL (e.g. via Cloudflare Tunnel)
+  SOLVER: { fetch: (req: Request) => Promise<Response> }; // service binding → mirrorbot-solver
+  SCRAPER_API_KEY?: string;  // optional fallback: scraperapi.com
+  FS_URL?: string;           // optional fallback: FlareSolverr via tunnel
 }
 
 interface ExecutionContext {
@@ -45,7 +46,7 @@ async function saveSession(kv: KVNamespace, chatId: number, s: Session): Promise
 // --- Bypass config from env --------------------------------------------
 
 function bypassCfg(env: Env): BypassConfig {
-  return { scraperApiKey: env.SCRAPER_API_KEY, fsUrl: env.FS_URL };
+  return { solver: env.SOLVER, scraperApiKey: env.SCRAPER_API_KEY, fsUrl: env.FS_URL };
 }
 
 // --- Progress helper ----------------------------------------------------
