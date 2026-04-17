@@ -30,7 +30,12 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GPLAY_URL: ${{ secrets.GPLAY_URL }}
         run: |
           echo "$TELEGRAM_BOT_TOKEN" | npx wrangler secret put TELEGRAM_BOT_TOKEN --name mirrorbot
-          echo "$GPLAY_URL" | npx wrangler secret put GPLAY_URL --name mirrorbot
+
+      - name: Register webhook
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          curl -s "https://mirrorbot.goyslopgateway.workers.dev/setup"
+          echo "Webhook registered"
