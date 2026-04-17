@@ -150,16 +150,16 @@ async function handleMessage(
 
   if (text.startsWith("/dl ")) {
     const dlUrl = text.slice(4).trim();
-    await sendTyping(env.TELEGRAM_BOT_TOKEN, chatId);
+    const midDl = await sendMessageGetId(env.TELEGRAM_BOT_TOKEN, chatId, `🔗 Resolving download link…`);
     try {
       const link = await resolveDownload(env.RATE_KV, dlUrl);
       if (link) {
-        await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "Here's your link:", [[{ text: "⬇️  Download", url: link }]]);
+        await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, midDl, "✅ Here's your link:", [[{ text: "⬇️  Download APK", url: link }]]);
       } else {
-        await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "😕 Couldn't resolve a download link from that URL.");
+        await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, midDl, "😕 Couldn't resolve a download link from that URL.");
       }
     } catch (e) {
-      await handleError(e, env.TELEGRAM_BOT_TOKEN, chatId);
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, midDl, errorText(e));
     }
     return;
   }
@@ -171,25 +171,34 @@ async function handleMessage(
   const query = text.trim();
   if (!query) return;
 
-  await sendTyping(env.TELEGRAM_BOT_TOKEN, chatId);
+  // Send immediate "searching" message — user sees instant feedback
+  const messageId = await sendMessageGetId(
+    env.TELEGRAM_BOT_TOKEN, chatId,
+    `🔍 Searching APKMirror for <b>${esc(query)}</b>…`
+  );
 
   try {
     const results = await searchApps(env.RATE_KV, query);
 
     if (!results.length) {
-      await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `😕 No results for "<b>${esc(query)}</b>". Try a different name.`);
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId,
+        `😕 No results for "<b>${esc(query)}</b>". Try a different name.`);
       return;
     }
 
-    const messageId = await sendMessageGetId(
-      env.TELEGRAM_BOT_TOKEN, chatId,
+    await editMessage(
+      env.TELEGRAM_BOT_TOKEN, chatId, messageId,
       resultsText(query),
       resultsKeyboard(results)
     );
 
     await saveSession(env.RATE_KV, chatId, { step: "results", results, query, messageId });
   } catch (e) {
-    await handleError(e, env.TELEGRAM_BOT_TOKEN, chatId);
+    try {
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId, errorText(e));
+    } catch {
+      await handleError(e, env.TELEGRAM_BOT_TOKEN, chatId);
+    }
   }
 }
 
