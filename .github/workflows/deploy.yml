@@ -19,18 +19,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Create KV namespace if it doesn't exist, inject ID into wrangler.toml
+      # Create KV namespace if it doesn't exist, inject real ID into wrangler.toml
       - name: Provision KV namespace
         env:
           CF_API_EMAIL: goyslopgateway@gmail.com
           CF_API_KEY: ${{ secrets.CF_API_KEY }}
           CF_ACCOUNT_ID: 2069a0e7348e495373ef64e17cc6ecc1
         run: |
-          # List existing namespaces
           EXISTING=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces" \
             -H "X-Auth-Email: ${CF_API_EMAIL}" \
             -H "X-Auth-Key: ${CF_API_KEY}" | \
-            python3 -c "import sys,json; d=json.load(sys.stdin); ns=[n['id'] for n in d.get('result',[]) if n['title']=='mirrorbot-rate-kv']; print(ns[0] if ns else '')")
+            python3 -c "import sys,json; d=json.load(sys.stdin); ns=[n['id'] for n in (d.get('result') or []) if n['title']=='mirrorbot-rate-kv']; print(ns[0] if ns else '')")
 
           if [ -z "$EXISTING" ]; then
             KV_ID=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces" \
@@ -48,19 +47,16 @@ jobs:
 
       - name: Deploy worker
         uses: cloudflare/wrangler-action@v3
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         with:
-          apiEmail: goyslopgateway@gmail.com
-          apiKey: ${{ secrets.CF_API_KEY }}
           accountId: 2069a0e7348e495373ef64e17cc6ecc1
           command: deploy
 
-      # Push TELEGRAM_BOT_TOKEN as a Worker secret
       - name: Set Telegram bot token secret
         env:
-          CF_API_EMAIL: goyslopgateway@gmail.com
-          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CF_ACCOUNT_ID: 2069a0e7348e495373ef64e17cc6ecc1
         run: |
           echo "$TELEGRAM_BOT_TOKEN" | npx wrangler secret put TELEGRAM_BOT_TOKEN \
             --name mirrorbot
