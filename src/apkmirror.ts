@@ -62,6 +62,16 @@ export async function anonFetch(
 ): Promise<string> {
   await waitForSlot(kv);
 
+  // Skip proxy attempts if pool is cold (empty KV) — go direct immediately
+  // to avoid spending 5-10s fetching proxy lists on the first request.
+  // The pool will warm up on the next request.
+  const poolRaw = await kv.get("proxy_pool_v2").catch(() => null);
+  const poolSize = poolRaw ? (JSON.parse(poolRaw) as unknown[]).length : 0;
+  if (poolSize === 0) {
+    console.warn("anonFetch: proxy pool empty (cold start), using direct fetch");
+    return directFetch(url);
+  }
+
   let proxyAttempts = 0;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {

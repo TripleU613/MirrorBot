@@ -13,6 +13,10 @@ export interface Env {
   RATE_KV: KVNamespace;
 }
 
+interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
 // --- Session ------------------------------------------------------------
 
 type Session =
@@ -125,10 +129,9 @@ function friendlyError(e: unknown): string {
 
 // --- Worker entry -------------------------------------------------------
 
-const TIMEOUT_MS = 25000;
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/setup") {
@@ -145,10 +148,11 @@ export default {
       try { update = await req.json() as TelegramUpdate; }
       catch (e) { console.error("malformed webhook JSON:", e); return new Response("ok"); }
 
-      await Promise.race([
-        dispatch(update, env),
-        new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), TIMEOUT_MS)),
-      ]).catch(e => console.error("dispatch error:", e));
+      // Return 200 to Telegram immediately — process in background.
+      // This prevents Telegram from timing out and retrying the webhook.
+      ctx.waitUntil(
+        dispatch(update, env).catch(e => console.error("dispatch error:", e))
+      );
 
       return new Response("ok");
     }
