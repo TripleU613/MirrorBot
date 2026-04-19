@@ -477,7 +477,7 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
       chatId, msgId, env, undefined, undefined, `pkg:${pkg}`);
   }
 
-  // Pick a variant → send APK as Telegram file
+  // Pick a variant → try to send APK as Telegram file, fall back to URL button
   if (data.startsWith("v:")) {
     if (session.step !== "variants") return;
     const variant = session.variants[parseInt(data.slice(2), 10)];
@@ -486,32 +486,53 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
     const appName = session.appName;
     const archLabel = variant.arch === "arm64-v8a" ? "arm64" : "armv7";
 
-    // Show loading message
+    // Always show the download button — sendDocument often fails for large APKs
+    // from external URLs. Provide both options.
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
-      `⏳ <b>Sending ${esc(appName)}</b> (${archLabel})…\n\n<i>Downloading and uploading to Telegram…</i>`);
+      `📥 <b>${esc(appName)}</b> (${archLabel})\n\n` +
+      `<i>Tap ⬇️ to download directly, or tap 📨 to have the bot send the file.</i>`,
+      [
+        [{ text: "⬇️  Download APK", url: variant.downloadUrl }],
+        [{ text: "📨  Send as file", callback_data: `send:${data.slice(2)}` }],
+        [{ text: "← Back to variants", callback_data: "back2" }],
+      ]);
+    return;
+  }
 
-    // Try to send as Telegram document (Telegram downloads from URL)
+  // Send APK as Telegram file (background, may take a while)
+  if (data.startsWith("send:")) {
+    if (session.step !== "variants") return;
+    const variant = session.variants[parseInt(data.slice(5), 10)];
+    if (!variant) return;
+
+    const appName = session.appName;
+    const archLabel = variant.arch === "arm64-v8a" ? "arm64" : "armv7";
+
+    await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
+      `⏳ <b>Uploading ${esc(appName)}</b> (${archLabel}) to Telegram…\n<i>This may take 30–60 seconds for large apps.</i>`);
+
     const caption =
       `📦 <b>${esc(appName)}</b>\n` +
       `Architecture: <code>${esc(variant.arch)}</code>\n` +
-      (variant.versionCode ? `Build: <code>${variant.versionCode}</code>\n` : "") +
       `\n<i>via APK Mirror Bot</i>`;
 
-    const result = await sendDocument(env.TELEGRAM_BOT_TOKEN, chatId, variant.downloadUrl, caption);
+    // Race sendDocument against a 55s timeout
+    const result = await Promise.race([
+      sendDocument(env.TELEGRAM_BOT_TOKEN, chatId, variant.downloadUrl, caption),
+      new Promise<{ ok: false }>((r) => setTimeout(() => r({ ok: false }), 55000)),
+    ]);
 
     if (result.ok) {
-      // File sent — update loading message
       await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
         `✅ <b>${esc(appName)}</b> (${archLabel}) sent above ↑`,
-        [[{ text: "← Back to variants", callback_data: "back2" }]]);
+        [[{ text: "← Back to variants", callback_data: "back2" }]]).catch(() => {});
     } else {
-      // File too large or error — fall back to direct download link
       await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
-        `📥 <b>${esc(appName)}</b> (${archLabel})\n\nTap below to download:`,
+        `😕 Could not send as file. Tap below to download directly:`,
         [
           [{ text: "⬇️  Download APK", url: variant.downloadUrl }],
           [{ text: "← Back to variants", callback_data: "back2" }],
-        ]);
+        ]).catch(() => {});
     }
     return;
   }
