@@ -5,7 +5,7 @@ import {
 } from "./telegram";
 import {
   searchApps, getVariants, getAppInfo, resolveDownload,
-  seedToken, getStoredToken, acquireToken, debugDelivery,
+  seedToken, getStoredToken, acquireToken, debugDelivery, resolveApkPureUrl,
   GPlayError, TokenMissingError, TokenExpiredError,
   AppResult, Variant, ProgressFn,
 } from "./gplay";
@@ -249,6 +249,13 @@ export default {
       }
     }
 
+    // GET /debug-apkpure-socket?pkg=com.whatsapp — test raw socket CDN resolution
+    if (req.method === "GET" && url.pathname === "/debug-apkpure-socket") {
+      const pkg = url.searchParams.get("pkg") ?? "com.whatsapp";
+      const cdnUrl = await resolveApkPureUrl(pkg).catch(String);
+      return Response.json({ pkg, cdn_url: cdnUrl });
+    }
+
     // GET /debug-apkpure?pkg=com.whatsapp — test APKPure redirect
     if (req.method === "GET" && url.pathname === "/debug-apkpure") {
       const pkg = url.searchParams.get("pkg") ?? "com.whatsapp";
@@ -477,7 +484,7 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
       chatId, msgId, env, undefined, undefined, `pkg:${pkg}`);
   }
 
-  // Pick a variant → try to send APK as Telegram file, fall back to URL button
+  // Pick a variant → send APK as Telegram file directly
   if (data.startsWith("v:")) {
     if (session.step !== "variants") return;
     const variant = session.variants[parseInt(data.slice(2), 10)];
@@ -486,16 +493,31 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
     const appName = session.appName;
     const archLabel = variant.arch === "arm64-v8a" ? "arm64" : "armv7";
 
-    // Always show the download button — sendDocument often fails for large APKs
-    // from external URLs. Provide both options.
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
-      `📥 <b>${esc(appName)}</b> (${archLabel})\n\n` +
-      `<i>Tap ⬇️ to download directly, or tap 📨 to have the bot send the file.</i>`,
-      [
-        [{ text: "⬇️  Download APK", url: variant.downloadUrl }],
-        [{ text: "📨  Send as file", callback_data: `send:${data.slice(2)}` }],
-        [{ text: "← Back to variants", callback_data: "back2" }],
-      ]);
+      `⏳ <b>Sending ${esc(appName)}</b> (${archLabel})…`);
+
+    const caption =
+      `📦 <b>${esc(appName)}</b>\nArchitecture: <code>${esc(variant.arch)}</code>\n\n<i>via APK Mirror Bot</i>`;
+
+    const result = await Promise.race([
+      sendDocument(env.TELEGRAM_BOT_TOKEN, chatId, variant.downloadUrl, caption),
+      new Promise<{ ok: false }>((r) => setTimeout(() => r({ ok: false }), 58000)),
+    ]);
+
+    console.log(`sendDocument: ok=${result.ok} pkg=${variant.packageName}`);
+
+    if (result.ok) {
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
+        `✅ <b>${esc(appName)}</b> (${archLabel}) sent above ↑`,
+        [[{ text: "← Back to variants", callback_data: "back2" }]]).catch(() => {});
+    } else {
+      await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
+        `📥 <b>${esc(appName)}</b> (${archLabel}) — tap to download:`,
+        [
+          [{ text: "⬇️  Download APK", url: variant.downloadUrl }],
+          [{ text: "← Back to variants", callback_data: "back2" }],
+        ]).catch(() => {});
+    }
     return;
   }
 
@@ -509,16 +531,20 @@ async function handleCallback(cb: NonNullable<TelegramUpdate["callback_query"]>,
     const archLabel = variant.arch === "arm64-v8a" ? "arm64" : "armv7";
 
     await editMessage(env.TELEGRAM_BOT_TOKEN, chatId, msgId,
-      `⏳ <b>Uploading ${esc(appName)}</b> (${archLabel}) to Telegram…\n<i>This may take 30–60 seconds for large apps.</i>`);
+      `⏳ <b>Uploading ${esc(appName)}</b> (${archLabel}) to Telegram…\n<i>This may take 30–60 seconds.</i>`);
 
     const caption =
       `📦 <b>${esc(appName)}</b>\n` +
       `Architecture: <code>${esc(variant.arch)}</code>\n` +
       `\n<i>via APK Mirror Bot</i>`;
 
+    // Resolve the real CDN URL via raw socket (bypasses CF IP detection on APKPure)
+    const cdnUrl = await resolveApkPureUrl(variant.packageName).catch(() => null);
+    const uploadUrl = cdnUrl ?? variant.downloadUrl;
+
     // Race sendDocument against a 55s timeout
     const result = await Promise.race([
-      sendDocument(env.TELEGRAM_BOT_TOKEN, chatId, variant.downloadUrl, caption),
+      sendDocument(env.TELEGRAM_BOT_TOKEN, chatId, uploadUrl, caption),
       new Promise<{ ok: false }>((r) => setTimeout(() => r({ ok: false }), 55000)),
     ]);
 

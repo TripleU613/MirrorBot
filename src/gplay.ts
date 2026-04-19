@@ -1,3 +1,5 @@
+import { connect } from "cloudflare:sockets";
+
 // Google Play APK client — pure Cloudflare Workers TypeScript.
 //
 // Auth: AuroraStore anonymous token (seeded once via /seed-token, lasts months).
@@ -460,11 +462,55 @@ export async function getVariants(
 // APKPure's d.apkpure.net API is not CF-protected and accessible from Workers.
 // Returns a signed CDN URL (winudf.com) for the latest APK.
 
-function apkPureUrl(packageName: string, arch: "arm64" | "armeabi"): string {
-  // Return the APKPure download URL directly — the user's browser resolves the redirect
-  // to the signed CDN URL. We don't resolve it in the Worker (CF IPs get blocked).
-  const archParam = arch === "arm64" ? "arm64-v8a" : "armeabi-v7a";
-  return `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest&nc=${arch}`;
+function apkPureUrl(packageName: string, _arch: "arm64" | "armeabi"): string {
+  return `https://d.apkpure.net/b/APK/${encodeURIComponent(packageName)}?version=latest`;
+}
+
+// Resolve APKPure redirect via raw TCP socket (no CF fingerprint → gets real CDN URL)
+export async function resolveApkPureUrl(packageName: string): Promise<string | null> {
+  // connect is imported at the top of this file
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+
+  let socket;
+  try {
+    socket = await connect({ hostname: "d.apkpure.net", port: 443 }, { secureTransport: "off" });
+    const tlsSocket = socket.startTls({ expectedServerHostname: "d.apkpure.net" });
+
+    const w = tlsSocket.writable.getWriter();
+    const r = tlsSocket.readable.getReader();
+
+    const req =
+      `GET /b/APK/${encodeURIComponent(packageName)}?version=latest HTTP/1.1\r\n` +
+      `Host: d.apkpure.net\r\n` +
+      `User-Agent: Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36\r\n` +
+      `Accept: text/html,*/*;q=0.8\r\n` +
+      `Connection: close\r\n\r\n`;
+
+    await w.write(enc.encode(req));
+
+    let resp = "";
+    const timeout = new Promise<null>(res => setTimeout(() => res(null), 8000));
+    const read = async () => {
+      while (!resp.includes("\r\n\r\n")) {
+        const { value, done } = await r.read();
+        if (done) break;
+        resp += dec.decode(value);
+      }
+      return resp;
+    };
+    const result = await Promise.race([read(), timeout]);
+
+    w.releaseLock(); r.releaseLock();
+
+    if (!result) return null;
+
+    const locMatch = /^location:\s*(.+)$/im.exec(result);
+    const loc = locMatch?.[1]?.trim();
+    if (loc && loc.startsWith("https://")) return loc;
+    return null;
+  } catch { return null; }
+  finally { try { await socket?.close(); } catch {} }
 }
 
 async function fetchDelivery(
